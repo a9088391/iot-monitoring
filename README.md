@@ -1,0 +1,52 @@
+# IoT 設備監控
+
+本機展示包含兩個場域、六台設備與三個示範帳號。總部可查看全部設備，場域帳號只能查看所屬場域。登入後可查看清單及單台設備資料，也可手動登出。
+
+## 啟動與操作
+
+需要透過本機 Unix socket 連線的 Docker Engine、支援 `build --builder` 與 `up --wait` 的 Docker Compose，以及 OpenSSL。在專案根目錄執行下列指令。
+
+```sh
+./bin/start
+```
+
+啟動器會在建置前檢查本機 Docker 端點、Compose 專案名稱和既有資源歸屬。若同名資源沒有此工作目錄的歸屬資訊，啟動會中止並保留原資源。
+
+使用 Chrome 或 Chromium 開啟 [http://iot.localhost:18241](http://iot.localhost:18241)。曾用舊的 `127.0.0.1` 網址登入時，切換後需重新登入。瀏覽器仍會依原期限保存舊網址的 Cookie。首次啟動後，可在自己的終端機查看隨機示範密碼。
+
+```sh
+cat .local/demo-passwords.json
+```
+
+| 帳號 | 可見設備 |
+| --- | --- |
+| `hq` | 北區與南區，共六台 |
+| `north` | 北區，三台 |
+| `south` | 南區，三台 |
+
+以任一帳號登入，選擇設備可查看詳細資料。登出後換另一個帳號，即可比較可見範圍。登入八小時後到期。登入嘗試受每帳號每分鐘五次與每來源每分鐘三十次的限制。 配額以 PostgreSQL 的 60 秒滾動視窗計算，重啟會沿用未到期的紀錄。
+
+用 `docker compose stop` 停止服務，用 `./bin/start` 再啟動。PostgreSQL 資料保存在本專案的 `data` 資料卷，`.local/` 保存在本機。請一併保留資料卷與 `.local/` 以便重啟，並妥善保管憑證。若啟動失敗，執行 `docker compose ps` 檢查服務狀態，或執行 `docker compose logs app db` 查看啟動原因。
+
+## 架構與開發
+
+- Go 1.27.3／Gin 1.12.0 提供 API 和 Vue 靜態檔案。伺服器依 session 決定場域，並使用 PostgreSQL 啟動鎖限制為單一實例。
+- Vue 3.5.45／TypeScript 6.0.3／Vite 8.3.6 提供同來源的登入和設備查詢介面。瀏覽器透過限定於 `iot.localhost` 主機的 `HttpOnly`、`SameSite=Strict` Cookie 使用伺服器端 session。
+- PostgreSQL 18.6 保存帳號雜湊、場域、設備及 session。Compose 只將網站發布到 `127.0.0.1`，資料庫留在 Compose 網路。這套 HTTP 設定供本機展示使用。
+
+前端依賴及映像均已固定於 lockfile、`Dockerfile` 與 `compose.yaml`。本機開發檢查可使用 Go 1.27.3 和 Node.js 24.22.2。
+
+```sh
+(cd backend && go test ./... && go vet ./... && go build -o /dev/null .)
+(cd frontend && npm ci && npm run typecheck && npm run build)
+```
+
+## 端到端測試
+
+準備 Node.js 24.22.2、正在執行的本機 Docker，以及 Chrome 或 Chromium。若瀏覽器安裝於其他位置，可用 `CHROME_EXECUTABLE` 指定執行檔。
+
+```sh
+(cd tests && npm ci && npm test)
+```
+
+測試透過 `./bin/start` 建置和啟動獨立 Compose 專案，以真實 PostgreSQL、HTTP 和 Chrome 驗證登入防護、場域權限、重啟及瀏覽器操作。測試會使用自己的暫存目錄、連接埠和資料卷，並在結束時清理。已在 macOS arm64、OrbStack Docker Engine 29.8.2、Compose 5.5.0 與 Chrome 156.0.8078.82 驗證。

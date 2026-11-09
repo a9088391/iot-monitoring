@@ -1,0 +1,55 @@
+name: iot-monitoring
+services:
+  db:
+    image: postgres:18.6-alpine3.24@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
+    environment:
+      POSTGRES_DB: iot
+      POSTGRES_USER: iot
+      POSTGRES_PASSWORD_FILE: /run/secrets/iot-db-password
+    volumes:
+      - data:/var/lib/postgresql
+      - type: bind
+        source: ./.local/db-password
+        target: /run/secrets/iot-db-password
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "iot", "-d", "iot"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  app:
+    build:
+      context: .
+      labels:
+        io.iot-monitoring.project-root: "${IOT_PROJECT_ROOT:-}"
+    environment:
+      IOT_DB_HOST: db
+      IOT_ORIGIN: http://iot.localhost:${IOT_PORT:-18241}
+    ports:
+      - target: 8080
+        published: "${IOT_PORT:-18241}"
+        host_ip: 127.0.0.1
+    volumes:
+      - type: bind
+        source: ./.local
+        target: /state
+        bind:
+          create_host_path: false
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --header \"Host: $${IOT_ORIGIN#http://}\" http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+volumes:
+  data:
+    labels:
+      io.iot-monitoring.project-root: "${IOT_PROJECT_ROOT:-}"
+networks:
+  default:
+    labels:
+      io.iot-monitoring.project-root: "${IOT_PROJECT_ROOT:-}"

@@ -1,0 +1,8 @@
+# 本機代理指引、規格與任務不納入版本控制。
+/AGENTS.md
+/.scratch/
+
+/.local/
+/frontend/node_modules/
+/frontend/dist/
+/tests/node_modules/

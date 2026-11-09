@@ -1,0 +1,117 @@
+#!/bin/sh
+set -eu
+unset CDPATH
+cd -P "$(dirname "$0")/.."
+umask 077
+port=${IOT_PORT:-18241}
+case "$port" in
+    *[!0-9]*|0*|80|??????*) printf '%s\n' '啟動失敗：IOT_PORT 必須是 1 至 65535 之間且不為 80 的整數。' >&2; exit 1 ;;
+esac
+if [ "$port" -gt 65535 ]; then
+    printf '%s\n' '啟動失敗：IOT_PORT 超過 65535。' >&2
+    exit 1
+fi
+
+fail() {
+    printf '啟動失敗：%s\n' "$1" >&2
+    exit 1
+}
+
+project_root=$(pwd -P)
+project=${COMPOSE_PROJECT_NAME:-iot-monitoring}
+if [ "$project" != iot-monitoring ]; then
+    suite_dir=$(dirname "$project_root")
+    tmp_dir=$(cd /tmp && pwd -P)
+    suffix=${project#iot01_test_}
+    # 測試只能使用 /tmp 下與工作目錄同名的隔離專案。
+    case "$(basename "$suite_dir")" in
+        iot01-suite-?*) ;;
+        *) fail 'Compose 專案名稱不屬於本專案。' ;;
+    esac
+    case "$suffix" in
+        *[!0-9a-f]*) fail 'Compose 專案名稱不屬於本專案。' ;;
+    esac
+    [ "$project" = "iot01_test_$suffix" ] && [ "${#suffix}" -eq 16 ] && [ "$(dirname "$suite_dir")" = "$tmp_dir" ] &&
+        [ "$project_root" = "$suite_dir/$project" ] || fail 'Compose 專案名稱不屬於本專案。'
+fi
+
+# 具名 context 優先於 DOCKER_HOST。解析後固定 socket，建置與啟動使用同一目標。
+if [ -n "${DOCKER_CONTEXT:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
+    unset DOCKER_HOST
+    context=$(docker context show) || fail '無法確認 Docker context。'
+    endpoint=$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}') ||
+        fail '無法確認 Docker 端點。'
+else
+    endpoint=$DOCKER_HOST
+fi
+case "$endpoint" in
+    unix:///?*) ;;
+    *) fail 'Docker 必須使用本機 Unix socket。' ;;
+esac
+unset DOCKER_CONTEXT DOCKER_HOST BUILDX_BUILDER BUILDKIT_HOST
+unset COMPOSE_COMPATIBILITY COMPOSE_ENV_FILES COMPOSE_REMOVE_ORPHANS
+IOT_PROJECT_ROOT=$project_root
+export IOT_PROJECT_ROOT
+
+docker_local() {
+    docker --host "$endpoint" "$@"
+}
+
+check_resource_owner() {
+    kind=$1 name=$2 filter=$3 labels=$4 description=$5
+    matches=$(docker_local "$kind" ls -q --filter "$filter") || fail "無法檢查 $description。"
+    [ -n "$matches" ] || return 0
+    owner=$(docker_local "$kind" inspect --format "{{index $labels \"io.iot-monitoring.project-root\"}}" "$name") ||
+        fail "無法確認 $description 的歸屬。"
+    [ "$owner" = "$project_root" ] || fail "${description}不屬於此工作目錄。"
+}
+
+containers=$(docker_local ps -a -q --filter "label=com.docker.compose.project=$project") ||
+    fail '無法檢查 Compose 容器。'
+# 同名但缺少 Compose 標記的容器也可能擋住啟動，須在建置前確認歸屬。
+named_containers=$(docker_local ps -a -q --filter "name=^/${project}-(app|db)-1\$") ||
+    fail '無法檢查 Compose 容器名稱。'
+for container in $containers $named_containers; do
+    owner=$(docker_local container inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.project.config_files"}}|{{index .Config.Labels "com.docker.compose.project"}}' "$container") ||
+        fail '無法確認 Compose 容器的歸屬。'
+    [ "$owner" = "$project_root|$project_root/compose.yaml|$project" ] || fail 'Compose 容器不屬於此工作目錄。'
+done
+check_resource_owner volume "${project}_data" "name=^${project}_data\$" .Labels 'Compose 資料卷'
+check_resource_owner network "${project}_default" "name=^${project}_default\$" .Labels 'Compose 網路'
+check_resource_owner image "${project}-app:latest" "reference=${project}-app:latest" .Config.Labels 'Compose 應用映像'
+
+private_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] && [ -s "$1" ] &&
+        [ "$(ls -ld "$1" | cut -c 1-10)" = "-rw-------" ]
+}
+
+if [ ! -e .local ] && [ ! -L .local ]; then
+    mkdir -m 700 .local || [ -d .local ]
+fi
+if [ ! -d .local ] || [ -L .local ] ||
+    [ "$(ls -ld .local | cut -c 1-10)" != "drwx------" ]; then
+    printf '%s\n' '啟動失敗：.local 必須是權限 0700 的本機目錄。' >&2
+    exit 1
+fi
+
+# 先完成私密檔案，再以不可覆蓋的方式發布；兩次同時啟動也會沿用同一組密碼。
+if [ ! -e .local/db-password ] && [ ! -L .local/db-password ]; then
+    temporary=$(mktemp .local/.db-password.XXXXXX)
+    trap 'rm -f "$temporary"' EXIT
+    trap 'exit 1' HUP INT TERM
+    openssl rand -hex 32 > "$temporary"
+    if ! ln "$temporary" .local/db-password 2>/dev/null && ! private_file .local/db-password; then
+        printf '%s\n' '啟動失敗：無法建立資料庫憑證。' >&2
+        exit 1
+    fi
+    rm -f "$temporary"
+    trap - EXIT HUP INT TERM
+fi
+if ! private_file .local/db-password; then
+    printf '%s\n' '啟動失敗：資料庫憑證必須是權限 0600 的可讀取一般檔案。' >&2
+    exit 1
+fi
+
+docker_local compose --env-file /dev/null -p "$project" -f "$project_root/compose.yaml" build --builder default
+docker_local compose --env-file /dev/null -p "$project" -f "$project_root/compose.yaml" up --no-build --wait
+printf 'IoT 設備監控已啟動：http://iot.localhost:%s\n' "$port"
