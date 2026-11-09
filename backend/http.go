@@ -27,9 +27,10 @@ const (
 )
 
 type application struct {
-	host, origin string
-	db           *lockedDB
-	hashSlots    chan struct{}
+	host, origin   string
+	db             *lockedDB
+	hashSlots      chan struct{}
+	measurementNow func() time.Time
 }
 
 func (a *application) router() http.Handler {
@@ -66,6 +67,8 @@ func (a *application) router() http.Handler {
 	api.GET("/session", a.session)
 	api.GET("/devices", a.devices)
 	api.GET("/devices/:id", a.device)
+	api.GET("/alerts", a.alerts)
+	api.GET("/alerts/:id", a.alert)
 	return router
 }
 
@@ -347,6 +350,50 @@ func (a *application) device(c *gin.Context) {
 		return
 	}
 	item, err := a.findDevice(c.Request.Context(), user.SiteID, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		reject(c, http.StatusNotFound, "not_found")
+		return
+	}
+	if err != nil {
+		unavailable(c)
+		return
+	}
+	c.JSON(http.StatusOK, item)
+}
+
+func (a *application) alerts(c *gin.Context) {
+	if !emptyBody(c) {
+		return
+	}
+	limit, offset, ok := parsePage(c.Request.URL.RawQuery)
+	if !ok {
+		reject(c, http.StatusBadRequest, "invalid_input")
+		return
+	}
+	if user, ok := a.authenticated(c); ok {
+		result, err := a.listAlerts(c.Request.Context(), user.SiteID, limit, offset)
+		if err != nil {
+			unavailable(c)
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	}
+}
+
+func (a *application) alert(c *gin.Context) {
+	if !noQuery(c) || !emptyBody(c) {
+		return
+	}
+	user, ok := a.authenticated(c)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 63)
+	if err != nil || id == 0 {
+		reject(c, http.StatusNotFound, "not_found")
+		return
+	}
+	item, err := a.findAlert(c.Request.Context(), user.SiteID, int64(id))
 	if errors.Is(err, sql.ErrNoRows) {
 		reject(c, http.StatusNotFound, "not_found")
 		return

@@ -32,7 +32,7 @@ cat .local/demo-passwords.json
 
 - Go 1.27.3／Gin 1.12.0 提供 API 和 Vue 靜態檔案。伺服器依 session 決定場域，並使用 PostgreSQL 啟動鎖限制為單一實例。
 - Vue 3.5.45／TypeScript 6.0.3／Vite 8.3.6 提供同來源的登入和設備查詢介面。瀏覽器透過限定於 `iot.localhost` 主機的 `HttpOnly`、`SameSite=Strict` Cookie 使用伺服器端 session。
-- PostgreSQL 18.6 保存帳號雜湊、場域、設備及 session。Compose 只將網站發布到 `127.0.0.1`，資料庫留在 Compose 網路。這套 HTTP 設定供本機展示使用。
+- PostgreSQL 18.6 保存帳號雜湊、場域、設備、session、每台設備的最新測量及溫度告警。Compose 只將網站發布到 `127.0.0.1`，資料庫留在 Compose 網路。這套 HTTP 設定供本機展示使用。
 
 前端依賴及映像均已固定於 lockfile、`Dockerfile` 與 `compose.yaml`。本機開發檢查可使用 Go 1.27.3 和 Node.js 24.22.2。
 
@@ -40,6 +40,16 @@ cat .local/demo-passwords.json
 (cd backend && go test ./... && go vet ./... && go build -o /dev/null .)
 (cd frontend && npm ci && npm run typecheck && npm run build)
 ```
+
+## 溫度與告警 API
+
+在後端以 `SubmitMeasurement(ctx, Measurement)` 送入應用內模擬器回報。回報須符合設備目前允許的資料世代和執行識別，並通過順序與生成時間檢查。抵達與採用前的回報年齡均須在五秒內，包含恰好五秒。設備的最新測量與告警在同一筆交易提交，方法以 `(adopted, err)` 區分已採用、略過與資料庫錯誤。
+
+全新啟動時尚無允許的執行紀錄，因此回報會以 `(false, nil)` 略過。要驗證採用流程，請執行 `./bin/test-measurements`，它會在隔離資料庫準備允許的執行紀錄並送出測量。
+
+登入後可透過 `GET /api/devices` 和 `GET /api/devices/:id` 讀取已採用的 `latestMeasurement`，其中 `receivedAt` 是入列前的抵達時間。`GET /api/alerts` 提供告警清單，`GET /api/alerts/:id` 讀取單筆告警。場域帳號只能讀取本場域，總部可跨場域查閱。清單以 `limit` 和 `offset` 分頁，預設 50 筆，最多 100 筆。
+
+低於 18°C 或高於 28°C 會建立一筆溫度告警。同設備持續超標沿用該筆，收到 18～28°C 回報後標記恢復。恢復後再超標會建立新告警。
 
 ## 端到端測試
 
@@ -50,3 +60,9 @@ cat .local/demo-passwords.json
 ```
 
 測試透過 `./bin/start` 建置和啟動獨立 Compose 專案，以真實 PostgreSQL、HTTP 和 Chrome 驗證登入防護、場域權限、重啟及瀏覽器操作。測試會使用自己的暫存目錄、連接埠和資料卷，並在結束時清理。已在 macOS arm64、OrbStack Docker Engine 29.8.2、Compose 5.5.0 與 Chrome 156.0.8078.82 驗證。
+
+測量整合測試另需 Go 1.27.3 與 `compose.yaml` 指定的本機 PostgreSQL 映像。它使用可控時鐘呼叫測量介面，透過正式 HTTP 路由驗證提交與回滾。測試使用無外部網路的 PostgreSQL 容器及專用資料卷，並在資料庫重啟後從新的 Go 程序驗證溫度與告警讀回。結束時清理測試容器與資料卷。
+
+```sh
+./bin/test-measurements
+```

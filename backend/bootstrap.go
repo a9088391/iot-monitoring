@@ -59,6 +59,31 @@ const createSeedDevices = `
 		('south-01', '南區設備 01', 'south'), ('south-02', '南區設備 02', 'south'), ('south-03', '南區設備 03', 'south');
 `
 
+const createMeasurementSchema = `
+	CREATE TABLE IF NOT EXISTS measurement_runs (
+		device_id text PRIMARY KEY REFERENCES devices(id),
+		data_generation bigint NOT NULL CHECK (data_generation > 0),
+		run_id bigint NOT NULL CHECK (run_id > 0)
+	);
+	CREATE TABLE IF NOT EXISTS latest_measurements (
+		device_id text PRIMARY KEY REFERENCES devices(id),
+		temperature double precision NOT NULL,
+		sequence bigint NOT NULL CHECK (sequence >= 0),
+		generated_at_ns bigint NOT NULL,
+		received_at_ns bigint NOT NULL CHECK (received_at_ns >= generated_at_ns)
+	);
+	CREATE TABLE IF NOT EXISTS alerts (
+		id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+		device_id text NOT NULL REFERENCES devices(id),
+		type text NOT NULL,
+		temperature double precision NOT NULL,
+		detected_at_ns bigint NOT NULL,
+		recovered_at_ns bigint CHECK (recovered_at_ns >= detected_at_ns)
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS alerts_active_device_type_idx
+		ON alerts (device_id, type) WHERE recovered_at_ns IS NULL;
+`
+
 func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -66,7 +91,7 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, createSchema); err != nil {
+	if _, err := tx.ExecContext(ctx, createSchema+createMeasurementSchema); err != nil {
 		return operationFailure("create IoT schema", err)
 	}
 	var count int

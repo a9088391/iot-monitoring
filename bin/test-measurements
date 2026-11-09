@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+unset CDPATH
+cd -P "$(dirname "$0")/.."
+
+if [ -n "${DOCKER_CONTEXT:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
+    unset DOCKER_HOST
+    context=$(docker context show)
+    endpoint=$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}')
+else
+    endpoint=$DOCKER_HOST
+fi
+case "$endpoint" in
+    unix:///?*) ;;
+    *) printf '%s\n' '測量測試需要本機 Docker Unix socket。' >&2; exit 1 ;;
+esac
+unset DOCKER_CONTEXT DOCKER_HOST
+docker_local() {
+    docker --host "$endpoint" "$@"
+}
+
+image=$(docker_local compose --env-file /dev/null -f compose.yaml config --images db)
+arch=$(docker_local image inspect --format '{{.Architecture}}' "$image")
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/iot-measurements.XXXXXXXX")
+container=
+cleanup() {
+    status=$?
+    if [ -n "$container" ]; then
+        docker_local rm -fv "$container" >/dev/null || status=1
+    fi
+    rm -f "$temporary/measurements.test" || status=1
+    rmdir "$temporary" || status=1
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+(cd backend && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+    go test -c -o "$temporary/measurements.test" .)
+
+# 使用新建容器的匿名資料卷跨重啟保留資料，清理時一併刪除。
+container=$(docker_local run --pull=never -d --network none --volume /var/lib/postgresql \
+    -e POSTGRES_USER=iot -e POSTGRES_DB=iot_measurement_test -e POSTGRES_HOST_AUTH_METHOD=trust "$image")
+
+wait_postgres() {
+    attempt=0
+    until docker_local exec "$container" pg_isready -qh 127.0.0.1 -U iot -d iot_measurement_test; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -eq 30 ]; then
+            docker_local logs "$container" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+run_test() {
+    docker_local exec --user postgres -e IOT_MEASUREMENT_TEST=1 "$container" \
+        /tmp/measurements.test -test.run "^$1\$" -test.count=1 -test.v -test.timeout=60s
+}
+
+wait_postgres
+docker_local cp "$temporary/measurements.test" "$container:/tmp/measurements.test"
+registered=$(docker_local exec --user postgres "$container" /tmp/measurements.test -test.list '^TestMeasurement(Integration|Restart)$')
+if ! printf '%s\n' "$registered" | grep -qx TestMeasurementIntegration ||
+   ! printf '%s\n' "$registered" | grep -qx TestMeasurementRestart; then
+    printf '%s\n' '找不到測量整合或重啟讀回測試。' >&2
+    exit 1
+fi
+
+run_test TestMeasurementIntegration
+docker_local restart --time 10 "$container" >/dev/null
+wait_postgres
+run_test TestMeasurementRestart

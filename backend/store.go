@@ -17,10 +17,11 @@ type identity struct {
 }
 
 type deviceItem struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	SiteID   string `json:"siteId"`
-	SiteName string `json:"siteName"`
+	ID                string           `json:"id"`
+	Name              string           `json:"name"`
+	SiteID            string           `json:"siteId"`
+	SiteName          string           `json:"siteName"`
+	LatestMeasurement *measurementItem `json:"latestMeasurement,omitempty"`
 }
 
 type devicePage struct {
@@ -32,7 +33,7 @@ type devicePage struct {
 
 const dbOperationTimeout = 4 * time.Second
 
-// 所有 API 查詢使用原啟動鎖的連線，失去連線時不會換一條無鎖連線重試。
+// API 與測量操作使用原啟動鎖的連線，失去連線時不會換一條無鎖連線重試。
 type lockedDB struct {
 	conn *sql.Conn
 	gate chan struct{}
@@ -200,8 +201,31 @@ func (a *application) sessionIdentity(ctx context.Context, hash []byte) (user id
 
 const deviceSource = `
 	FROM devices d JOIN sites s ON s.id = d.site_id
+	LEFT JOIN latest_measurements m ON m.device_id = d.id
 	WHERE ($1::text IS NULL OR d.site_id = $1)
 `
+
+const deviceColumns = `
+	SELECT d.id, d.name, d.site_id, s.name, m.temperature, m.sequence, m.generated_at_ns, m.received_at_ns
+`
+
+func scanDevice(row rowScanner) (deviceItem, error) {
+	var item deviceItem
+	var temperature sql.NullFloat64
+	var sequence, generated, received sql.NullInt64
+	if err := row.Scan(&item.ID, &item.Name, &item.SiteID, &item.SiteName,
+		&temperature, &sequence, &generated, &received); err != nil {
+		return deviceItem{}, err
+	}
+	if generated.Valid {
+		item.LatestMeasurement = &measurementItem{
+			Temperature: temperature.Float64, Sequence: sequence.Int64,
+			GeneratedAt: time.Unix(0, generated.Int64).UTC(),
+			ReceivedAt:  time.Unix(0, received.Int64).UTC(),
+		}
+	}
+	return item, nil
+}
 
 func (a *application) listDevices(ctx context.Context, siteID *string, limit, offset int) (devicePage, error) {
 	result := devicePage{Items: make([]deviceItem, 0, limit), Limit: limit, Offset: offset}
@@ -209,16 +233,14 @@ func (a *application) listDevices(ctx context.Context, siteID *string, limit, of
 		if err := conn.QueryRowContext(ctx, "SELECT count(*) "+deviceSource, siteID).Scan(&result.Total); err != nil {
 			return err
 		}
-		rows, err := conn.QueryContext(ctx, `
-			SELECT d.id, d.name, d.site_id, s.name
-		`+deviceSource+` ORDER BY d.id LIMIT $2 OFFSET $3`, siteID, limit, offset)
+		rows, err := conn.QueryContext(ctx, deviceColumns+deviceSource+` ORDER BY d.id LIMIT $2 OFFSET $3`, siteID, limit, offset)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var item deviceItem
-			if err := rows.Scan(&item.ID, &item.Name, &item.SiteID, &item.SiteName); err != nil {
+			item, err := scanDevice(rows)
+			if err != nil {
 				return err
 			}
 			result.Items = append(result.Items, item)
@@ -230,9 +252,8 @@ func (a *application) listDevices(ctx context.Context, siteID *string, limit, of
 
 func (a *application) findDevice(ctx context.Context, siteID *string, id string) (item deviceItem, err error) {
 	err = a.db.use(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		return conn.QueryRowContext(ctx, `
-			SELECT d.id, d.name, d.site_id, s.name
-		`+deviceSource+` AND d.id = $2`, siteID, id).Scan(&item.ID, &item.Name, &item.SiteID, &item.SiteName)
+		item, err = scanDevice(conn.QueryRowContext(ctx, deviceColumns+deviceSource+` AND d.id = $2`, siteID, id))
+		return err
 	})
 	return item, err
 }
