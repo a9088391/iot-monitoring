@@ -188,13 +188,15 @@ func (a *application) revokeSession(ctx context.Context, hash []byte) error {
 	})
 }
 
+const sessionIdentitySQL = `
+	SELECT a.username, a.role, a.site_id
+	FROM sessions s JOIN accounts a ON a.username = s.username
+	WHERE s.token_hash = $1 AND s.expires_at > statement_timestamp()
+`
+
 func (a *application) sessionIdentity(ctx context.Context, hash []byte) (user identity, err error) {
 	err = a.db.use(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		return conn.QueryRowContext(ctx, `
-			SELECT a.username, a.role, a.site_id
-			FROM sessions s JOIN accounts a ON a.username = s.username
-			WHERE s.token_hash = $1 AND s.expires_at > statement_timestamp()
-		`, hash).Scan(&user.Username, &user.Role, &user.SiteID)
+		return conn.QueryRowContext(ctx, sessionIdentitySQL, hash).Scan(&user.Username, &user.Role, &user.SiteID)
 	})
 	return user, err
 }

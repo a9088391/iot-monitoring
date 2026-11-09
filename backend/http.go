@@ -31,6 +31,7 @@ type application struct {
 	db             *lockedDB
 	hashSlots      chan struct{}
 	measurementNow func() time.Time
+	simulator      *simulator
 }
 
 func (a *application) router() http.Handler {
@@ -67,6 +68,8 @@ func (a *application) router() http.Handler {
 	api.GET("/session", a.session)
 	api.GET("/devices", a.devices)
 	api.GET("/devices/:id", a.device)
+	api.GET("/devices/:id/simulation", a.simulationControl)
+	api.POST("/devices/:id/simulation", a.simulationControl)
 	api.GET("/alerts", a.alerts)
 	api.GET("/alerts/:id", a.alert)
 	return router
@@ -136,57 +139,67 @@ type loginInput struct {
 
 func parseLogin(body []byte) (loginInput, bool) {
 	var input loginInput
+	ok := parseRequiredStrings(body, map[string]*string{"username": &input.username, "password": &input.password})
+	return input, ok
+}
+
+func parseRequiredStrings(body []byte, fields map[string]*string) bool {
 	if !utf8.Valid(body) {
-		return input, false
+		return false
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
-		return input, false
+		return false
 	}
 	for decoder.More() {
-		key, err := decoder.Token()
-		if err != nil {
-			return input, false
-		}
-		var field *string
-		switch key {
-		case "username":
-			field = &input.username
-		case "password":
-			field = &input.password
-		default:
-			return input, false
-		}
-		if *field != "" {
-			return input, false
-		}
 		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := token.(string)
+		field := fields[key]
+		if !ok || field == nil || *field != "" {
+			return false
+		}
+		token, err = decoder.Token()
 		value, ok := token.(string)
 		if err != nil || !ok || value == "" {
-			return input, false
+			return false
 		}
 		*field = value
 	}
 	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
-		return input, false
+		return false
 	}
 	_, err := decoder.Token()
-	return input, err == io.EOF && input.username != "" && input.password != ""
+	if err != io.EOF {
+		return false
+	}
+	for _, field := range fields {
+		if *field == "" {
+			return false
+		}
+	}
+	return true
 }
 
-func (a *application) login(c *gin.Context) {
-	if !noQuery(c) {
-		return
-	}
+func readJSONBody(c *gin.Context) ([]byte, bool) {
 	contentTypes := c.Request.Header.Values("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if err != nil || len(contentTypes) != 1 || mediaType != "application/json" ||
 		(len(params) > 0 && (len(params) != 1 || !strings.EqualFold(params["charset"], "utf-8"))) ||
 		len(c.Request.Header.Values("Content-Encoding")) != 0 {
 		reject(c, http.StatusUnsupportedMediaType, "unsupported_media_type")
+		return nil, false
+	}
+	return readBody(c)
+}
+
+func (a *application) login(c *gin.Context) {
+	if !noQuery(c) {
 		return
 	}
-	body, ok := readBody(c)
+	body, ok := readJSONBody(c)
 	if !ok {
 		return
 	}
@@ -345,7 +358,7 @@ func (a *application) device(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
-	if len(id) > 64 || !utf8.ValidString(id) || strings.ContainsRune(id, 0) {
+	if !validDeviceID(id) {
 		reject(c, http.StatusNotFound, "not_found")
 		return
 	}

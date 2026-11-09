@@ -12,6 +12,13 @@ type Device = {
   name: string
   siteId: string
   siteName: string
+  latestMeasurement?: { temperature: number }
+}
+
+type Simulation = {
+  mode: 'stopped' | 'normal' | 'abnormal'
+  version: string
+  canReplay: boolean
 }
 
 type DevicePage = {
@@ -30,6 +37,14 @@ class ApiError extends Error {
 
 const pageSize = 50
 const csrfHeaders = { 'X-CSRF-Protection': '1' }
+const simulationModes = { stopped: '已停止', normal: '正常回報', abnormal: '異常回報' }
+const simulationActions = {
+  normal: { label: '開始正常回報', success: '已開始正常回報。' },
+  abnormal: { label: '開始異常回報', success: '已開始異常回報。' },
+  stop: { label: '停止回報', success: '已停止模擬回報。' },
+  replay: { label: '重複回報', success: '已重送最近一筆原始測量。' },
+}
+const noReplayMessage = '尚無可重送的測量。'
 const identity = ref<Identity | null>(null)
 const initialized = ref(false)
 const sessionError = ref('')
@@ -50,6 +65,12 @@ const selectedDevice = ref<Device | null>(null)
 const detailLoading = ref(false)
 const detailError = ref('')
 const detailCanRetry = ref(false)
+const simulation = ref<Simulation | null>(null)
+const simulationLoading = ref(false)
+const simulationPending = ref(false)
+const simulationReadError = ref('')
+const simulationActionError = ref('')
+const simulationFeedback = ref('')
 
 let identityGeneration = 0
 let detailController: AbortController | null = null
@@ -60,6 +81,7 @@ const currentPage = computed(() => Math.floor(offset.value / pageSize) + 1)
 const deviceRange = computed(() => total.value === 0
   ? '共 0 台設備'
   : `${offset.value + 1}–${Math.min(offset.value + devices.value.length, total.value)} / ${total.value} 台設備`)
+const simulationBusy = computed(() => detailLoading.value || simulationLoading.value || simulationPending.value)
 
 function errorCode(value: unknown): string {
   if (typeof value === 'object' && value !== null && 'error' in value && typeof value.error === 'string') {
@@ -112,6 +134,7 @@ function clearProtectedState(): number {
   detailLoading.value = false
   detailError.value = ''
   detailCanRetry.value = false
+  clearSimulation()
   loginPending.value = false
   logoutPending.value = false
   logoutUnconfirmed.value = false
@@ -251,31 +274,122 @@ async function confirmAndRetryLogout(): Promise<void> {
   }
 }
 
-async function loadDevice(id: string): Promise<void> {
+async function refreshDevice(): Promise<void> {
+  const id = selectedDeviceId.value
+  const controller = detailController
   const generation = identityGeneration
+  if (!id || !controller || detailLoading.value) return
+  detailError.value = ''
+  detailCanRetry.value = false
+  detailLoading.value = true
+  try {
+    const device = await readApi<Device>(`/api/devices/${encodeURIComponent(id)}`, generation, controller)
+    if (detailController === controller) selectedDevice.value = device
+  } catch (error) {
+    if (detailController !== controller || isAbort(error)) return
+    if (error instanceof ApiError && error.status === 401) expireSession(generation)
+    else {
+      if (error instanceof ApiError && (error.status === 403 || error.status === 404)) selectedDevice.value = null
+      detailError.value = apiMessage(error, '設備資料載入失敗，請重試。')
+      detailCanRetry.value = !(error instanceof ApiError && error.status === 404)
+    }
+  } finally {
+    if (detailController === controller) detailLoading.value = false
+  }
+}
+
+function clearSimulation(): void {
+  simulation.value = null
+  simulationLoading.value = false
+  simulationPending.value = false
+  simulationReadError.value = ''
+  simulationActionError.value = ''
+  simulationFeedback.value = ''
+}
+
+function simulationPath(id: string): string {
+  return `/api/devices/${encodeURIComponent(id)}/simulation`
+}
+
+async function loadSimulation(): Promise<void> {
+  const device = selectedDevice.value
+  const controller = detailController
+  const generation = identityGeneration
+  if (!device || !controller || identity.value?.role !== 'headquarters' || simulationLoading.value) return
+  simulationReadError.value = ''
+  simulationLoading.value = true
+  try {
+    const state = await readApi<Simulation>(simulationPath(device.id), generation, controller)
+    if (detailController === controller) simulation.value = state
+  } catch (error) {
+    if (detailController !== controller || isAbort(error)) return
+    if (error instanceof ApiError && error.status === 401) expireSession(generation)
+    else simulationReadError.value = apiMessage(error, '模擬狀態載入失敗，請重試。')
+  } finally {
+    if (detailController === controller) simulationLoading.value = false
+  }
+}
+
+async function changeSimulation(action: keyof typeof simulationActions): Promise<void> {
+  const device = selectedDevice.value
+  const state = simulation.value
+  const controller = detailController
+  const generation = identityGeneration
+  if (!device || !state || !controller || identity.value?.role !== 'headquarters' || simulationBusy.value ||
+    (action === 'replay' && !state.canReplay)) return
+
+  simulationPending.value = true
+  simulationActionError.value = ''
+  simulationFeedback.value = ''
+  try {
+    try {
+      const updated = await writeApi<Simulation>(simulationPath(device.id), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...csrfHeaders },
+        body: JSON.stringify({ action, version: state.version }),
+      })
+      if (detailController !== controller) return
+      simulation.value = updated
+      simulationFeedback.value = simulationActions[action].success
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        expireSession(generation)
+        return
+      }
+      if (detailController !== controller) return
+      simulation.value = null
+      if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+        simulationReadError.value = apiMessage(error, '無法操作這台設備。')
+        return
+      }
+      if (error instanceof ApiError && error.code === 'conflict') {
+        simulationActionError.value = '模擬狀態已變更，請確認目前模式後再操作。'
+      } else if (error instanceof ApiError && error.code === 'no_measurement') {
+        simulationActionError.value = noReplayMessage
+      } else if (error instanceof ApiError && error.status === 400) {
+        simulationActionError.value = '操作內容無效，請確認目前模擬狀態後再操作。'
+      } else {
+        simulationActionError.value = '未能確認操作結果。請確認目前模擬狀態後再操作。'
+      }
+      // 讀回目前版本供下一次手動操作，避免自動重送已執行或已過時的指令。
+      await loadSimulation()
+    }
+    if (detailController === controller) await refreshDevice()
+  } finally {
+    if (detailController === controller) simulationPending.value = false
+  }
+}
+
+async function loadDevice(id: string): Promise<void> {
   detailController?.abort()
   const controller = new AbortController()
   detailController = controller
   selectedDeviceId.value = id
   selectedDevice.value = null
-  detailError.value = ''
-  detailCanRetry.value = false
-  detailLoading.value = true
-  try {
-    selectedDevice.value = await readApi<Device>(`/api/devices/${encodeURIComponent(id)}`, generation, controller)
-  } catch (error) {
-    if (generation !== identityGeneration || isAbort(error)) return
-    if (error instanceof ApiError && error.status === 401) expireSession(generation)
-    else {
-      detailError.value = apiMessage(error, '設備資料載入失敗，請重試。')
-      detailCanRetry.value = !(error instanceof ApiError && error.status === 404)
-    }
-  } finally {
-    if (detailController === controller) {
-      detailController = null
-      if (generation === identityGeneration) detailLoading.value = false
-    }
-  }
+  clearSimulation()
+  detailLoading.value = false
+  await refreshDevice()
+  if (detailController === controller) await loadSimulation()
 }
 
 function returnToList(): void {
@@ -286,6 +400,7 @@ function returnToList(): void {
   detailLoading.value = false
   detailError.value = ''
   detailCanRetry.value = false
+  clearSimulation()
   view.value = 'list'
 }
 
@@ -295,10 +410,7 @@ function openDevice(id: string): void {
 }
 
 onMounted(restoreSession)
-onUnmounted(() => {
-  for (const controller of readControllers) controller.abort()
-  readControllers.clear()
-})
+onUnmounted(clearProtectedState)
 </script>
 
 <template>
@@ -378,12 +490,31 @@ onUnmounted(() => {
       <button type="button" class="back-button" @click="returnToList">← 返回設備清單</button>
       <h2 id="device-detail-title">{{ selectedDevice?.name ?? '設備詳細資料' }}</h2>
       <p v-if="detailLoading" aria-live="polite">正在載入設備資料…</p>
-      <p v-else-if="detailError" class="notice" role="alert">{{ detailError }}</p>
-      <dl v-else-if="selectedDevice" class="device-details">
+      <p v-if="detailError" class="notice" role="alert">{{ detailError }}</p>
+      <dl v-if="selectedDevice" class="device-details">
         <div><dt>設備編號</dt><dd>{{ selectedDevice.id }}</dd></div>
         <div><dt>場域</dt><dd>{{ selectedDevice.siteName }}</dd></div>
+        <div>
+          <dt>最新有效溫度</dt>
+          <dd>{{ selectedDevice.latestMeasurement ? `${selectedDevice.latestMeasurement.temperature}°C` : '尚未回報' }}</dd>
+        </div>
       </dl>
-      <button v-if="detailError && detailCanRetry && selectedDeviceId" type="button" class="button button-secondary" @click="loadDevice(selectedDeviceId)">重新載入</button>
+      <button v-if="detailError && detailCanRetry && selectedDeviceId" type="button" class="button button-secondary" :disabled="simulationBusy" @click="selectedDevice ? refreshDevice() : loadDevice(selectedDeviceId)">重新載入</button>
+
+      <section v-if="selectedDevice && identity.role === 'headquarters'" class="simulation-controls" aria-labelledby="simulation-title">
+        <h3 id="simulation-title">模擬控制</h3>
+        <p v-if="simulation" role="status">模擬模式：{{ simulationModes[simulation.mode] }}</p>
+        <p v-if="simulationLoading" role="status">正在載入模擬狀態…</p>
+        <p v-else-if="simulationPending" role="status">正在處理模擬操作…</p>
+        <p v-if="simulationActionError" class="notice" role="alert">{{ simulationActionError }}</p>
+        <p v-if="simulationReadError" class="notice" role="alert">{{ simulationReadError }}</p>
+        <p v-if="simulationFeedback" role="status">{{ simulationFeedback }}</p>
+        <div v-if="simulation" class="simulation-actions">
+          <button v-for="(option, action) in simulationActions" :key="action" type="button" class="button button-secondary" :disabled="simulationBusy || (action === 'replay' && !simulation.canReplay)" @click="changeSimulation(action)">{{ option.label }}</button>
+        </div>
+        <p v-if="simulation && !simulation.canReplay && simulationActionError !== noReplayMessage" class="muted">{{ noReplayMessage }}</p>
+        <button v-if="simulationReadError" type="button" class="button button-secondary" :disabled="simulationBusy" @click="loadSimulation">重新載入模擬狀態</button>
+      </section>
     </section>
   </main>
 </template>
@@ -438,6 +569,10 @@ input { width: 100%; min-height: 2.8rem; padding: 0.6rem 0.75rem; border: 1px so
 .device-details div { display: grid; grid-template-columns: minmax(7rem, 0.35fr) 1fr; gap: 1rem; padding: 0.9rem 0; border-top: 1px solid #e7ede8; }
 .device-details dt { color: #607066; }
 .device-details dd { margin: 0; overflow-wrap: anywhere; }
+.simulation-controls { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #e7ede8; }
+.simulation-controls h3 { margin-top: 0; }
+.simulation-actions { display: flex; flex-wrap: wrap; gap: 0.65rem; }
+.simulation-actions + p { margin: 0.65rem 0 0; }
 
 @media (max-width: 36rem) {
   .page { padding: 1.5rem 0; }

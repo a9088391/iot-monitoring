@@ -34,16 +34,22 @@ func freshMeasurement(generated, now time.Time) bool {
 	return !generated.After(now) && now.Sub(generated) <= measurementMaxAge
 }
 
+func validDeviceID(id string) bool {
+	return len(id) > 0 && len(id) <= 64 && utf8.ValidString(id) && !strings.ContainsRune(id, 0)
+}
+
+func (a *application) measurementClock() time.Time {
+	if a.measurementNow != nil {
+		return a.measurementNow()
+	}
+	return time.Now()
+}
+
 // SubmitMeasurement 在入列前記錄抵達時間，只有完整提交才回傳採用成功。
 func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement) (adopted bool, err error) {
-	clock := a.measurementNow
-	if clock == nil {
-		clock = time.Now
-	}
-	received, generated := clock().UTC(), sample.GeneratedAt.UTC()
+	received, generated := a.measurementClock().UTC(), sample.GeneratedAt.UTC()
 	generatedNS, receivedNS := generated.UnixNano(), received.UnixNano()
-	if sample.Source != SimulatorMeasurementSource || sample.DeviceID == "" || len(sample.DeviceID) > 64 ||
-		!utf8.ValidString(sample.DeviceID) || strings.ContainsRune(sample.DeviceID, 0) ||
+	if sample.Source != SimulatorMeasurementSource || !validDeviceID(sample.DeviceID) ||
 		sample.DataGeneration <= 0 || sample.RunID <= 0 || sample.Sequence < 0 ||
 		math.IsNaN(sample.Temperature) || math.IsInf(sample.Temperature, 0) ||
 		!freshMeasurement(generated, received) ||
@@ -90,7 +96,7 @@ func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("lock active temperature alert: %w", err)
 		}
-		now := clock().UTC()
+		now := a.measurementClock().UTC()
 		nowNS := now.UnixNano()
 		if !freshMeasurement(generated, now) || !time.Unix(0, nowNS).Equal(now) {
 			return nil

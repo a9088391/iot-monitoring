@@ -84,6 +84,23 @@ const createMeasurementSchema = `
 		ON alerts (device_id, type) WHERE recovered_at_ns IS NULL;
 `
 
+const createSimulationSchema = `
+	CREATE TABLE IF NOT EXISTS device_simulations (
+		device_id text PRIMARY KEY REFERENCES devices(id),
+		mode text NOT NULL CHECK (mode IN ('stopped', 'normal', 'abnormal')),
+		version bigint NOT NULL CHECK (version > 0),
+		first_expected_at_ns bigint
+	);
+	CREATE TABLE IF NOT EXISTS simulation_history (
+		device_id text NOT NULL REFERENCES devices(id),
+		version bigint NOT NULL CHECK (version > 0),
+		actor text NOT NULL REFERENCES accounts(username),
+		action text NOT NULL CHECK (action IN ('normal', 'abnormal', 'stop', 'replay')),
+		occurred_at_ns bigint NOT NULL,
+		PRIMARY KEY (device_id, version)
+	);
+`
+
 func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -91,7 +108,7 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, createSchema+createMeasurementSchema); err != nil {
+	if _, err := tx.ExecContext(ctx, createSchema+createMeasurementSchema+createSimulationSchema); err != nil {
 		return operationFailure("create IoT schema", err)
 	}
 	var count int

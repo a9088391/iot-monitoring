@@ -3,6 +3,14 @@ set -eu
 unset CDPATH
 cd -P "$(dirname "$0")/.."
 
+case "$#:${1:-}" in
+    0:) suite=Measurement ;;
+    1:simulation) suite=Simulation ;;
+    *) printf '%s\n' '用法：bin/test-measurements [simulation]' >&2; exit 2 ;;
+esac
+integration_test=Test${suite}Integration
+restart_test=Test${suite}Restart
+
 if [ -n "${DOCKER_CONTEXT:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
     unset DOCKER_HOST
     context=$(docker context show)
@@ -61,14 +69,14 @@ run_test() {
 
 wait_postgres
 docker_local cp "$temporary/measurements.test" "$container:/tmp/measurements.test"
-registered=$(docker_local exec --user postgres "$container" /tmp/measurements.test -test.list '^TestMeasurement(Integration|Restart)$')
-if ! printf '%s\n' "$registered" | grep -qx TestMeasurementIntegration ||
-   ! printf '%s\n' "$registered" | grep -qx TestMeasurementRestart; then
+registered=$(docker_local exec --user postgres "$container" /tmp/measurements.test -test.list "^Test${suite}(Integration|Restart)\$")
+if ! printf '%s\n' "$registered" | grep -qx "$integration_test" ||
+   ! printf '%s\n' "$registered" | grep -qx "$restart_test"; then
     printf '%s\n' '找不到測量整合或重啟讀回測試。' >&2
     exit 1
 fi
 
-run_test TestMeasurementIntegration
+run_test "$integration_test"
 docker_local restart --time 10 "$container" >/dev/null
 wait_postgres
-run_test TestMeasurementRestart
+run_test "$restart_test"

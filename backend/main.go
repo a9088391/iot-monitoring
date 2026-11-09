@@ -106,12 +106,17 @@ func run(ctx context.Context) error {
 	if err := bootstrap(startup, conn, state); err != nil {
 		return err
 	}
+	if err := stopSimulationsOnStartup(startup, conn); err != nil {
+		return err
+	}
 	cancel()
 	a := application{
 		host: host, origin: origin,
 		db:        &lockedDB{conn: conn, gate: make(chan struct{}, 1)},
 		hashSlots: make(chan struct{}, 8),
 	}
+	a.simulator = newSimulator(ctx, a.SubmitMeasurement)
+	defer a.simulator.close()
 	return a.serve(ctx)
 }
 

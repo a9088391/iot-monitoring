@@ -92,12 +92,19 @@ func openMeasurementTestState(t *testing.T, create bool) *os.Root {
 
 func newMeasurementFixture(t *testing.T, conn *sql.Conn) *measurementFixture {
 	t.Helper()
-	f := &measurementFixture{
-		app: &application{
-			host: "iot.localhost:8090", origin: measurementTestOrigin,
-			db: &lockedDB{conn: conn, gate: make(chan struct{}, 1)}, hashSlots: make(chan struct{}, 8),
-		},
+	return serveMeasurementFixture(t, measurementTestApplication(conn))
+}
+
+func measurementTestApplication(conn *sql.Conn) *application {
+	return &application{
+		host: "iot.localhost:8090", origin: measurementTestOrigin,
+		db: &lockedDB{conn: conn, gate: make(chan struct{}, 1)}, hashSlots: make(chan struct{}, 8),
 	}
+}
+
+func serveMeasurementFixture(t *testing.T, app *application) *measurementFixture {
+	t.Helper()
+	f := &measurementFixture{app: app}
 	f.server = httptest.NewServer(f.app.router())
 	f.server.Client().Timeout = 5 * time.Second
 	t.Cleanup(f.server.Close)
