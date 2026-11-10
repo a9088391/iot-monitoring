@@ -37,8 +37,8 @@ func TestClosureIntegration(t *testing.T) {
 	conn := target.conn
 	at := time.Date(2026, 11, 9, 10, 0, 0, 123456789, time.UTC)
 	passwords := seedLegacyMeasurementFixture(t, conn, state)
-	// 在第 04 票的結構上，經正式控制與測量入口建立一筆原有告警及 session。
-	simulationSQL(t, conn, createMeasurementSchema+createSimulationSchema+addOfflineAlertColumns)
+	// 保留第 04 票的告警結構，補上目前控制入口需要的世代表後建立原有告警與 session。
+	simulationSQL(t, conn, createMeasurementSchema+createSimulationSchema+addOfflineAlertColumns+createDataGenerationSchema)
 	legacy, observed := newOfflineFixture(t, conn, at, false)
 	legacy.hq = legacy.login(t, "hq", passwords["hq"])
 	const northDevice, southDevice = "north-01", "south-01"

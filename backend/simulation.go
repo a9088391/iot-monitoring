@@ -15,10 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	simulationInterval       = 5 * time.Second
-	simulationDataGeneration = 1
-)
+const simulationInterval = 5 * time.Second
 
 var (
 	errSimulationUnauthenticated = errors.New("simulation session is missing or expired")
@@ -218,7 +215,7 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 			device = &simulatedDevice{}
 		}
 		var firstExpected *int64
-		var sequence int64
+		var sequence, generation int64
 		start := action == "normal" || action == "abnormal"
 		nowNS := a.measurementClock().UnixNano()
 		switch {
@@ -226,9 +223,10 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 		case start:
 			mode, firstExpected = action, &nowNS
 			if err := tx.QueryRowContext(ctx, `
-				SELECT COALESCE((SELECT sequence FROM latest_measurements WHERE device_id = $1), -1)
-			`, id).Scan(&sequence); err != nil {
-				return fmt.Errorf("read latest adopted simulation sequence: %w", err)
+				SELECT generation, COALESCE((SELECT sequence FROM latest_measurements WHERE device_id = $1), -1)
+				FROM public.iot_data_generation WHERE singleton
+			`, id).Scan(&generation, &sequence); err != nil {
+				return fmt.Errorf("read simulation generation and latest adopted sequence: %w", err)
 			}
 			if device.latest != nil {
 				sequence = max(sequence, device.latest.Sequence)
@@ -267,7 +265,7 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 			_, err = tx.ExecContext(ctx, `
 				INSERT INTO measurement_runs (device_id, data_generation, run_id) VALUES ($1, $2, $3)
 				ON CONFLICT (device_id) DO UPDATE SET data_generation = excluded.data_generation, run_id = excluded.run_id
-			`, id, simulationDataGeneration, next)
+			`, id, generation, next)
 		case action == "stop":
 			_, err = tx.ExecContext(ctx, "DELETE FROM measurement_runs WHERE device_id = $1", id)
 		}
@@ -295,7 +293,7 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 				temperature = 30
 			}
 			outgoing = &Measurement{
-				Source: SimulatorMeasurementSource, DeviceID: id, DataGeneration: simulationDataGeneration,
+				Source: SimulatorMeasurementSource, DeviceID: id, DataGeneration: generation,
 				RunID: next, Sequence: sequence + 1, GeneratedAt: a.measurementClock().UTC(), Temperature: temperature,
 			}
 			s.devices[id] = device

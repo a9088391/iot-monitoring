@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log"
@@ -33,10 +34,88 @@ func main() {
 	defer stop()
 	// 以發布模式啟動 Gin，失敗時記錄可公開的啟動錯誤。
 	gin.SetMode(gin.ReleaseMode)
-	if err := run(ctx); err != nil {
+	if err := runCommand(ctx, os.Args[1:], os.Stdout); err != nil {
 		log.Print(err)
 		os.Exit(1)
 	}
+}
+
+// runCommand 將維護指令與服務啟動分流，維護程序不啟動 HTTP 或模擬器。
+func runCommand(ctx context.Context, args []string, stdout io.Writer) error {
+	switch {
+	case len(args) == 0:
+		return run(ctx)
+	case len(args) == 1 && args[0] == "reset-check":
+		return runReset(ctx, "", stdout)
+	case len(args) == 2 &&
+		args[0] == "reset-apply" &&
+		validResetToken(args[1]):
+		return runReset(ctx, args[1], stdout)
+	default:
+		return errors.New("IoT: invalid command or reset target token")
+	}
+}
+
+// openProtectedState 開啟正式狀態目錄，啟動與維護都先拒絕權限不符的憑證來源。
+func openProtectedState() (*os.Root, error) {
+	state, err := os.OpenRoot(stateDirectory)
+	if err != nil {
+		return nil, operationFailure("open /state", err)
+	}
+	info, err := state.Stat(".")
+	if err != nil {
+		state.Close()
+		return nil, operationFailure("inspect /state", err)
+	}
+	if info.Mode() != os.ModeDir|0o700 {
+		state.Close()
+		return nil, errors.New("IoT startup: /state must have mode 0700")
+	}
+	return state, nil
+}
+
+// iotDatabaseConfig 從受保護的密碼檔組成連線設定，公開錯誤只帶操作名稱。
+func iotDatabaseConfig(state *os.Root, host string) (*pgx.ConnConfig, error) {
+	passwordFile, err := readPrivateFile(state, "db-password")
+	if err != nil {
+		return nil, operationFailure("read /state/db-password as a mode-0600 regular file", err)
+	}
+	password := strings.TrimSuffix(string(passwordFile), "\n")
+	if host == "" || password == "" {
+		return nil, errors.New("IoT startup: a database host and nonempty database password are required")
+	}
+	dsn := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword("iot", password),
+		Host:     net.JoinHostPort(host, "5432"),
+		Path:     "/iot",
+		RawQuery: "sslmode=disable&application_name=iot-monitoring",
+	}
+	config, err := pgx.ParseConfig(dsn.String())
+	if err != nil {
+		return nil, operationFailure("configure PostgreSQL connection", err)
+	}
+	// 資料庫使用 UTC，取消請求時優先停止單筆查詢以保留持鎖連線。
+	config.RuntimeParams["timezone"] = "UTC"
+	config.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
+		// 優先取消單筆查詢，瀏覽器中斷時可保留原本持鎖的連線。
+		return &pgconn.CancelRequestContextWatcherHandler{
+			Conn: conn, CancelRequestDelay: 20 * time.Millisecond, DeadlineDelay: time.Second,
+		}
+	}
+	return config, nil
+}
+
+// lockIoTDatabase 讓正式服務與重設共用同一個工作階段層級的排他鎖。
+func lockIoTDatabase(ctx context.Context, conn *sql.Conn) error {
+	var held bool
+	if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1::bigint)", lockKey).Scan(&held); err != nil {
+		return operationFailure("acquire PostgreSQL startup lock", err)
+	}
+	if !held {
+		return errors.New("IoT startup: another instance holds the PostgreSQL startup lock")
+	}
+	return nil
 }
 
 // run 取得本案的 PostgreSQL 啟動鎖，完成初始化與重啟補判後才接受 HTTP 請求。
@@ -46,49 +125,14 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	// 先檢查狀態目錄的權限，再從此根目錄讀取憑證。
-	state, err := os.OpenRoot(stateDirectory)
+	state, err := openProtectedState()
 	if err != nil {
-		return operationFailure("open /state", err)
+		return err
 	}
 	defer state.Close()
-	info, err := state.Stat(".")
+	config, err := iotDatabaseConfig(state, os.Getenv("IOT_DB_HOST"))
 	if err != nil {
-		return operationFailure("inspect /state", err)
-	}
-	if info.Mode() != os.ModeDir|0o700 {
-		return errors.New("IoT startup: /state must have mode 0700")
-	}
-
-	// 從受保護的檔案組成 PostgreSQL 設定，錯誤只對外顯示操作名稱。
-	passwordFile, err := readPrivateFile(state, "db-password")
-	if err != nil {
-		return operationFailure("read /state/db-password as a mode-0600 regular file", err)
-	}
-	password := strings.TrimSuffix(string(passwordFile), "\n")
-	dbHost := os.Getenv("IOT_DB_HOST")
-	if dbHost == "" || password == "" {
-		return errors.New("IoT startup: IOT_DB_HOST and a nonempty database password are required")
-	}
-	dsn := url.URL{
-		Scheme:   "postgres",
-		User:     url.UserPassword("iot", password),
-		Host:     net.JoinHostPort(dbHost, "5432"),
-		Path:     "/iot",
-		RawQuery: "sslmode=disable&application_name=iot-monitoring",
-	}
-	config, err := pgx.ParseConfig(dsn.String())
-	if err != nil {
-		return operationFailure("configure PostgreSQL connection", err)
-	}
-	// 資料庫使用 UTC，取消請求時優先停止單筆查詢以保留持鎖連線。
-	config.RuntimeParams["timezone"] = "UTC"
-	config.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
-		// 優先取消單筆查詢，瀏覽器中斷時可保留原本持鎖的連線。
-		return &pgconn.CancelRequestContextWatcherHandler{
-			Conn: conn, CancelRequestDelay: 20 * time.Millisecond, DeadlineDelay: time.Second,
-		}
+		return err
 	}
 	// 只使用一條連線，讓啟動鎖與後續資料庫操作共用同一個 PostgreSQL 工作階段。
 	db := stdlib.OpenDB(*config)
@@ -104,12 +148,8 @@ func run(ctx context.Context) error {
 		return operationFailure("connect to PostgreSQL", err)
 	}
 	defer conn.Close()
-	var held bool
-	if err := conn.QueryRowContext(startup, "SELECT pg_try_advisory_lock($1::bigint)", lockKey).Scan(&held); err != nil {
-		return operationFailure("acquire PostgreSQL startup lock", err)
-	}
-	if !held {
-		return errors.New("IoT startup: another instance holds the PostgreSQL startup lock")
+	if err := lockIoTDatabase(startup, conn); err != nil {
+		return err
 	}
 	// 先準備資料並停用舊模擬執行，再依保留的計時基準補判離線。
 	if err := bootstrap(startup, conn, state); err != nil {

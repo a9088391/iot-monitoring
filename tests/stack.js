@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
+import { EventEmitter, once } from 'node:events'
+import { chmodSync, copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { request } from 'node:http'
 import { createServer } from 'node:net'
 import { join } from 'node:path'
@@ -53,9 +54,11 @@ export async function createStack() {
   const logs = []
 
   // 用固定目錄和環境執行有期限的子程序，將敏感輸出留給測試比對。
-  function run(command, args, phase, { input, expected = 0, timeout = 45_000, includeStderr = false } = {}) {
+  function run(command, args, phase, {
+    input, expected = 0, timeout = 45_000, includeStderr = false, commandEnv = env,
+  } = {}) {
     const result = spawnSync(command, args, {
-      cwd: root, env, input, timeout, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
+      cwd: root, env: commandEnv, input, timeout, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
     })
     // CLI 或 SQL 的輸出可能包含秘密，只回報階段與結束狀態。
     assert.equal(
@@ -111,7 +114,7 @@ export async function createStack() {
     mkdirSync(join(root, 'backend'))
     // 只複製建置所需檔案；後端來源限定 Go 程式與模組鎖定資訊。
     for (const file of [
-      '.dockerignore', 'compose.yaml', 'Dockerfile', 'bin/start',
+      '.dockerignore', 'compose.yaml', 'Dockerfile', 'bin/start', 'bin/reset',
       'frontend/index.html', 'frontend/package.json', 'frontend/package-lock.json',
       'frontend/tsconfig.json', 'frontend/vite.config.ts', 'frontend/src',
       ...readdirSync(join(source, 'backend'))
@@ -123,6 +126,8 @@ export async function createStack() {
         // 補上專案相對路徑，交給前面同一個複製流程。
         .map(file => `backend/${file}`),
     ]) copy(root, file)
+    // 重設入口會直接執行啟動器，暫存複本也須保有執行權限。
+    chmodSync(join(root, 'bin/start'), 0o700)
 
     // 驗證端點確實是本機 socket，再確認名稱無衝突，才取得清理權。
     const context = docker(['context', 'show'], '查詢 Docker context').trim()
@@ -244,6 +249,108 @@ export async function createStack() {
       '執行隔離 PostgreSQL 查詢', { input }).trim()
   }
 
+  // 只觀察原先通過隔離檢查的容器與資料卷，連停止狀態也可辨識。
+  function resetResources() {
+    assert.ok(
+      owned
+        && application
+        && database,
+      '尚未驗證重設資源隔離',
+    )
+    // 容器識別與啟動時間可分辨重啟、重建與從未停止。
+    function instance(id) {
+      const fields = '{{.Id}}|{{.State.Running}}|{{.State.StartedAt}}'
+      const [actualId, running, startedAt] = docker(['container', 'inspect', '--format', fields, id], '檢查原重設容器')
+        .trim()
+        .split('|')
+      return { id: actualId, running: running === 'true', startedAt }
+    }
+    const name = `${project}_data`
+    const createdAt = docker(['volume', 'inspect', '--format', '{{.CreatedAt}}', name], '檢查原重設資料卷').trim()
+    return { app: instance(application), db: instance(database), volume: { name, createdAt } }
+  }
+
+  // 只從隔離別名執行正式重設；錯誤端點固定為保留的無效 SSH 網域。
+  function reset(input, expected = 0, { remoteTarget = false } = {}) {
+    assert.ok(
+      owned
+        && application
+        && database,
+      '尚未驗證重設資源隔離',
+    )
+    const commandEnv = remoteTarget ? { ...env, DOCKER_HOST: 'ssh://docker.example.invalid' } : env
+    const output = run('sh', [join(alias, 'bin/reset')], '執行 bin/reset', {
+      input, expected, timeout: 120_000, includeStderr: true, commandEnv,
+    })
+    logs.push(output)
+    return output
+  }
+
+  // 暫停已確認的第一個重設，只在已驗證容器即將收到實際 stop 時讓另一個指令進場。
+  async function resetWithStopBarrier(whilePaused) {
+    const app = resetResources().app
+    assert.ok(app.running, '互斥驗證需要正在執行的本案應用')
+    const directory = mkdtempSync(join(suite, 'reset-barrier-'))
+    const realDocker = realpathSync(run('sh', ['-c', 'command -v docker'], '定位真實 Docker').trim())
+    const marker = 'iot reset fixture before stop'
+    // 只暫停特定 socket 與容器的 stop；控制管道中斷時不執行這次停止。
+    writeFileSync(join(directory, 'docker'), `#!/bin/sh
+if [ "$#" = 6 ] &&
+    [ "$1" = --host ] &&
+    [ "$2" = "$IOT_FIXTURE_SOCKET" ] &&
+    [ "$3" = stop ] &&
+    [ "$4" = --time ] &&
+    [ "$5" = 10 ] &&
+    [ "$6" = "$IOT_FIXTURE_APP" ]; then
+    printf '%s\\n' '${marker}' >&2
+    IFS= read -r proceed <&3 || exit 1
+    [ "$proceed" = continue ] || exit 1
+fi
+exec "$IOT_FIXTURE_DOCKER" "$@"
+`, { mode: 0o700 })
+    const child = spawn('sh', [join(alias, 'bin/reset')], {
+      cwd: root, timeout: 120_000, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+      env: {
+        ...env, PATH: `${directory}:${env.PATH}`,
+        IOT_FIXTURE_DOCKER: realDocker, IOT_FIXTURE_SOCKET: env.DOCKER_HOST, IOT_FIXTURE_APP: app.id,
+      },
+    })
+    const barrier = new EventEmitter()
+    const gate = child.stdio[3]
+    let stdout = ''
+    let stderr = ''
+    let controlError
+    // 保留控制管道錯誤供成功路徑檢查，仍等子程序結束後才回收隔離資源。
+    for (const pipe of [child.stdin, gate]) {
+      pipe.on('error', error => { controlError ??= error.code })
+    }
+    child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk })
+    child.stderr.setEncoding('utf8').on('data', chunk => {
+      stderr += chunk
+      if (stderr.includes(marker)) barrier.emit('ready')
+    })
+    const finished = new Promise(resolve => {
+      child.once('error', error => resolve(error.code))
+      child.once('close', (code, signal) => resolve(signal ?? code))
+    })
+    child.stdin.end(`RESET ${project}\n`)
+    let status
+    try {
+      await Promise.race([
+        once(barrier, 'ready', { signal: AbortSignal.timeout(30_000) }),
+        finished.then(() => assert.fail('重設在到達停止屏障前結束')),
+      ])
+      await whilePaused()
+      gate.end('continue\n')
+    } finally {
+      if (!gate.writableEnded) gate.end()
+      status = await finished
+      logs.push(stdout + stderr)
+    }
+    assert.equal(controlError ?? status, 0, '屏障放行後原指令應完成重設')
+    return stdout + stderr
+  }
+
   // 保留容器輸出供敏感值驗收，避免把日誌直接印進測試報告。
   function collectLogs() {
     logs.push(compose(['logs', '--no-color'], '讀取測試容器日誌', { includeStderr: true }))
@@ -268,5 +375,8 @@ export async function createStack() {
     database = undefined
   }
 
-  return { origin, loopbackOrigin, state, send, start, sql, stop, cleanup, secondInstance, collectLogs, logs }
+  return {
+    origin, loopbackOrigin, state, send, start, sql, stop, reset, resetResources, resetWithStopBarrier,
+    cleanup, secondInstance, collectLogs, logs,
+  }
 }

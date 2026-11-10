@@ -36,6 +36,22 @@ cat .local/demo-passwords.json
 
 用 `docker compose stop` 停止服務，用 `./bin/start` 再啟動。PostgreSQL 資料保存在本專案的 `data` 資料卷，`.local/` 保存在本機。請一併保留資料卷與 `.local/` 以便重啟，並妥善保管憑證。若啟動失敗，執行 `docker compose ps` 檢查服務狀態，或執行 `docker compose logs app db` 查看啟動原因。
 
+## 本機展示重設
+
+先以 `./bin/start` 建置包含重設功能的應用，並讓 PostgreSQL 維持執行。要清除本案的展示資料時，在專案根目錄執行下列指令。
+
+```sh
+./bin/reset
+```
+
+指令先核對本機 Docker、本案容器、資料卷、資料庫和原有憑證。確認顯示的工作目錄及資料庫後，輸入 `RESET iot-monitoring`。取消或輸入其他文字會保留原資料。
+
+確認後，指令停止本案應用，清除測量、告警、結案、模擬與控制歷程、登入及限流資料，再用原有憑證重建預載帳號、場域與設備。沒有備份時，清除的資料無法復原。資料卷和 `.local/` 會保留。
+
+重設提交後，指令會啟動同一個應用容器。模擬保持停止，舊回報失效，原有瀏覽器頁面會在重新連線確認舊登入失效後清除受保護內容。請用原有示範密碼重新登入。若交易失敗，資料會回滾。若指令回報無法確認結果，應用會保持停止，請先查驗資料庫。若已回報資料重設成功但應用未啟動，可執行 `./bin/start` 恢復服務。
+
+啟動和已確認的重設會共用本機維護鎖。若程序遭強制終止並留下 `.local/.maintenance-lock`，先確認本案沒有啟動或重設程序執行，再用 `rmdir .local/.maintenance-lock` 移除空目錄。
+
 ## 架構與開發
 
 - Go 1.27.3／Gin 1.12.0 提供 API 和 Vue 靜態檔案。伺服器依 session 決定場域，並使用 PostgreSQL 啟動鎖限制為單一實例。
@@ -111,4 +127,5 @@ data: {"version":"12","viewer":"<session-view>","expiresAt":"2026-01-01T00:00:00
 ./bin/test-measurements offline
 ./bin/test-measurements closure
 ./bin/test-measurements sse
+./bin/test-measurements reset
 ```

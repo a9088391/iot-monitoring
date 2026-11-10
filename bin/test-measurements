@@ -10,7 +10,8 @@ case "$#:${1:-}" in
     1:offline) suite=Offline ;;
     1:closure) suite=Closure ;;
     1:sse) suite=SSE ;;
-    *) printf '%s\n' '用法：bin/test-measurements [simulation|offline|closure|sse]' >&2; exit 2 ;;
+    1:reset) suite=Reset ;;
+    *) printf '%s\n' '用法：bin/test-measurements [simulation|offline|closure|sse|reset]' >&2; exit 2 ;;
 esac
 integration_test=Test${suite}Integration
 restart_test=Test${suite}Restart
@@ -43,7 +44,7 @@ cleanup() {
     if [ -n "$container" ]; then
         docker_local rm -fv "$container" >/dev/null || status=1
     fi
-    rm -f "$temporary/measurements.test" || status=1
+    rm -f "$temporary/measurements.test" "$temporary/reset-app" || status=1
     rmdir "$temporary" || status=1
     exit "$status"
 }
@@ -54,14 +55,26 @@ trap 'exit 1' HUP INT TERM
 (cd backend && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
     go test -c -o "$temporary/measurements.test" .)
 
-# 使用新建容器的匿名資料卷跨重啟保留資料，清理時一併刪除。
-container=$(docker_local run --pull=never -d --network none --volume /var/lib/postgresql \
-    -e POSTGRES_USER=iot -e POSTGRES_DB=iot_measurement_test -e POSTGRES_HOST_AUTH_METHOD=trust "$image")
+# 重設測試使用實際維護命令及 TCP 密碼認證。測試專用標記避免誤用正常展示庫。
+database=iot_measurement_test
+if [ "$suite" = Reset ]; then
+    database=iot
+    (cd backend && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+        go build -trimpath -o "$temporary/reset-app" .)
+    container=$(docker_local run --pull=never -d --network none --volume /var/lib/postgresql \
+        -e POSTGRES_USER=iot -e POSTGRES_DB="$database" \
+        -e POSTGRES_PASSWORD=iot-reset-fixture-password -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
+        "$image" postgres -c iot.reset_fixture=ticket07)
+else
+    # 使用新建容器的匿名資料卷跨重啟保留資料，清理時一併刪除。
+    container=$(docker_local run --pull=never -d --network none --volume /var/lib/postgresql \
+        -e POSTGRES_USER=iot -e POSTGRES_DB="$database" -e POSTGRES_HOST_AUTH_METHOD=trust "$image")
+fi
 
 # 啟動與重啟都等 PostgreSQL 可接受連線，逾時保留容器日誌以便定位。
 wait_postgres() {
     attempt=0
-    until docker_local exec "$container" pg_isready -qh 127.0.0.1 -U iot -d iot_measurement_test; do
+    until docker_local exec "$container" pg_isready -qh 127.0.0.1 -U iot -d "$database"; do
         attempt=$((attempt + 1))
         if [ "$attempt" -eq 30 ]; then
             docker_local logs "$container" >&2
@@ -79,6 +92,11 @@ run_test() {
 
 wait_postgres
 docker_local cp "$temporary/measurements.test" "$container:/tmp/measurements.test"
+if [ "$suite" = Reset ]; then
+    # CLI 透過正式 /state 讀取測試憑證，狀態與執行檔保留給同一容器的重啟測試。
+    docker_local exec --user root "$container" install -d -m 0700 -o postgres -g postgres /state
+    docker_local cp "$temporary/reset-app" "$container:/tmp/iot-reset-test-app"
+fi
 # Go 的測試篩選可在找不到案例時成功返回，因此先確認兩個測試皆已註冊。
 registered=$(docker_local exec --user postgres "$container" /tmp/measurements.test -test.list "^Test${suite}(Integration|Restart)\$")
 if ! printf '%s\n' "$registered" | grep -qx "$integration_test" ||

@@ -4,20 +4,23 @@ unset CDPATH
 cd -P "$(dirname "$0")/.."
 # 憑證建立前先收緊預設權限，讓其他本機帳號無法讀取暫存檔。
 umask 077
-port=${IOT_PORT:-18241}
-case "$port" in
-    *[!0-9]*|0*|80|??????*) printf '%s\n' '啟動失敗：IOT_PORT 必須是 1 至 65535 之間且不為 80 的整數。' >&2; exit 1 ;;
+operation=啟動
+case "$#:${1:-}" in
+    0:) ;;
+    1:--reset) operation=重設 ;;
+    *) printf '%s\n' '用法：./bin/start' >&2; exit 1 ;;
 esac
-if [ "$port" -gt 65535 ]; then
-    printf '%s\n' '啟動失敗：IOT_PORT 超過 65535。' >&2
-    exit 1
-fi
-
-# 啟動前置條件失敗就中止，避免沿用不符合本專案要求的資源。
+# 前置條件失敗就中止，避免沿用不符合本專案要求的資源。
 fail() {
-    printf '啟動失敗：%s\n' "$1" >&2
+    printf '%s失敗：%s\n' "$operation" "$1" >&2
     exit 1
 }
+
+port=${IOT_PORT:-18241}
+case "$port" in
+    *[!0-9]*|0*|80|??????*) fail 'IOT_PORT 必須是 1 至 65535 之間且不為 80 的整數。' ;;
+esac
+[ "$port" -le 65535 ] || fail 'IOT_PORT 超過 65535。'
 
 project_root=$(pwd -P)
 project=${COMPOSE_PROJECT_NAME:-iot-monitoring}
@@ -95,29 +98,182 @@ private_file() {
         [ "$(ls -ld "$1" | cut -c 1-10)" = "-rw-------" ]
 }
 
+# 狀態根目錄必須真實存在且只有擁有者能存取。
+private_state() {
+    [ -d .local ] &&
+        [ ! -L .local ] &&
+        [ "$(ls -ld .local | cut -c 1-10)" = "drwx------" ]
+}
+
+operation_lock=.local/.maintenance-lock
+temporary=
+
+# 清除本次產生的暫存憑證並釋放專案鎖，避免中止後留下可誤用的檔案。
+release_operation_lock() {
+    if [ -n "$temporary" ]; then
+        rm -f "$temporary"
+    fi
+    rmdir "$operation_lock"
+}
+
+# 序列化同一工作目錄的啟動與已確認重設，避免過期的重設再度停止已恢復的應用。
+take_operation_lock() {
+    mkdir "$operation_lock" 2>/dev/null ||
+        fail '無法取得本案維護鎖。若另有啟動或重設程序，請等它結束。'
+    trap release_operation_lock EXIT
+    trap 'exit 1' HUP INT TERM
+}
+
+# 只接受已驗證工作目錄、設定檔及服務名稱的實際容器，後續均以完整 ID 操作。
+reset_container() {
+    reset_service=$1
+    reset_id=$(docker_local container inspect --format '{{.Id}}' "$project-$reset_service-1") ||
+        fail "找不到本案 $reset_service 容器。"
+    case "$reset_id" in
+        ''|*[!0-9a-f]*) fail '容器識別無效。' ;;
+    esac
+    [ "${#reset_id}" -eq 64 ] || fail '容器識別無效。'
+    reset_owner=$(docker_local container inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.project.config_files"}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' "$reset_id") ||
+        fail '無法確認容器歸屬。'
+    [ "$reset_owner" = "$project_root|$project_root/compose.yaml|$project|$reset_service" ] ||
+        fail '容器不屬於此工作目錄。'
+    printf '%s\n' "$reset_id"
+}
+
+# 逐一核對實際映像與掛載，避免只憑 Compose 名稱決定資料庫。
+reset_targets() {
+    reset_app=$(reset_container app)
+    reset_db=$(reset_container db)
+    reset_image=$(docker_local container inspect --format '{{.Image}}' "$reset_app") ||
+        fail '無法確認本案應用映像。'
+    case "$reset_image" in
+        sha256:*) ;;
+        *) fail '應用映像識別無效。' ;;
+    esac
+    reset_owner=$(docker_local image inspect --format '{{index .Config.Labels "io.iot-monitoring.project-root"}}' "$reset_image") ||
+        fail '無法確認應用映像歸屬。'
+    [ "$reset_owner" = "$project_root" ] || fail '應用映像不屬於此工作目錄。'
+    reset_app_mount=$(docker_local container inspect --format '{{.HostConfig.NetworkMode}}|{{len .Mounts}}|{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{end}}' "$reset_app") ||
+        fail '無法確認應用狀態掛載。'
+    [ "$reset_app_mount" = "${project}_default|1|bind|$project_root/.local|/state|true" ] || fail '應用狀態掛載不符。'
+
+    # 重設使用原資料庫的網路命名空間，必須先核對映像、容器狀態和對外連接埠。
+    reset_db_ref=$(docker_local compose --env-file /dev/null -p "$project" -f "$project_root/compose.yaml" config --images db) ||
+        fail '無法確認 PostgreSQL 設定。'
+    reset_db_image=$(docker_local image inspect --format '{{.Id}}' "$reset_db_ref") ||
+        fail '找不到本案 PostgreSQL 映像。'
+    reset_db_target=$(docker_local container inspect --format '{{.Image}}|{{.State.Running}}|{{.HostConfig.NetworkMode}}|{{len .NetworkSettings.Networks}}|{{range .NetworkSettings.Ports}}{{if .}}published{{end}}{{end}}' "$reset_db") ||
+        fail '無法確認 PostgreSQL 容器。'
+    [ "$reset_db_target" = "$reset_db_image|true|${project}_default|1|" ] ||
+        fail 'PostgreSQL 必須使用本案映像、保持執行且不發布主機連接埠。'
+
+    # 必須是本案資料卷與同一份本機密碼檔，拒絕額外或替換的掛載。
+    reset_volume="$project"_data
+    reset_volume_owner=$(docker_local volume inspect --format '{{index .Labels "io.iot-monitoring.project-root"}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.volume"}}' "$reset_volume") ||
+        fail '無法確認資料卷歸屬。'
+    [ "$reset_volume_owner" = "$project_root|$project|data" ] || fail '資料卷歸屬不符。'
+    reset_mount_count=$(docker_local container inspect --format '{{len .Mounts}}' "$reset_db") ||
+        fail '無法確認 PostgreSQL 掛載數量。'
+    reset_data_mount=$(docker_local container inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Type}}|{{.Name}}|{{.RW}}{{end}}{{end}}' "$reset_db") ||
+        fail '無法確認 PostgreSQL 資料掛載。'
+    reset_password_mount=$(docker_local container inspect --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/iot-db-password"}}{{.Type}}|{{.Source}}|{{.RW}}{{end}}{{end}}' "$reset_db") ||
+        fail '無法確認 PostgreSQL 憑證掛載。'
+    [ "$reset_mount_count" = 2 ] &&
+        [ "$reset_data_mount" = "volume|$reset_volume|true" ] &&
+        [ "$reset_password_mount" = "bind|$project_root/.local/db-password|false" ] ||
+        fail 'PostgreSQL 資料或憑證掛載不符。'
+}
+
+# 只執行既有本機映像的維護程式，讓它從原容器的 loopback 連接 PostgreSQL。
+reset_run() {
+    docker_local run --rm --pull=never --read-only --network "container:$reset_db" \
+        --mount "type=bind,source=$project_root/.local,target=/state,readonly" \
+        --entrypoint /app/iot "$reset_image" "$@"
+}
+
+# 明確確認後才停止指定應用，重設提交後啟動同一容器以清除舊瀏覽器狀態。
+reset_project() {
+    case "$project_root" in
+        *','*|*'"'*) fail '工作目錄含有 Docker 掛載保留字元。' ;;
+    esac
+    reset_targets
+    reset_pins="$reset_app|$reset_db|$reset_image"
+    reset_token=$(reset_run reset-check) || fail '資料庫或既有示範憑證核對失敗。'
+    case "$reset_token" in
+        *:*) ;;
+        *) fail '資料庫目標識別無效。' ;;
+    esac
+    case "${reset_token%%:*}" in
+        ''|*[!0-9]*) fail '資料庫目標識別無效。' ;;
+    esac
+    case "${reset_token#*:}" in
+        ''|0*|*[!0-9]*) fail '資料世代識別無效。' ;;
+    esac
+
+    printf '%s\n' \
+        "本機重設目標：$project（$project_root）" \
+        "PostgreSQL：iot，資料卷：$reset_volume，叢集與資料世代：$reset_token" \
+        '會清除設備回報、告警、結案、模擬與歷程、登入與限流資料，並以原示範憑證重建預載帳號、場域和設備。' \
+        '沒有備份時無法復原。將停止應用，交易成功後重新啟動同一容器。' \
+        "輸入 RESET $project 確認："
+    IFS= read -r reset_answer || fail '未確認，已取消。'
+    [ "$reset_answer" = "RESET $project" ] || fail '未確認，已取消。'
+
+    # 取得專案鎖後才重驗及停機，並一直持有到同一應用恢復服務。
+    take_operation_lock
+    reset_targets
+    [ "$reset_pins" = "$reset_app|$reset_db|$reset_image" ] || fail '目標已變更，請重新核對。'
+    reset_current=$(reset_run reset-check) || fail '資料庫或既有示範憑證核對失敗。'
+    [ "$reset_current" = "$reset_token" ] || fail '資料庫目標已變更，請重新核對。'
+    docker_local stop --time 10 "$reset_app" >/dev/null || fail '無法停止本案應用。'
+    reset_running=$(docker_local container inspect --format '{{.State.Running}}' "$reset_app") ||
+        fail '無法確認應用停止。'
+    [ "$reset_running" = false ] || fail '本案應用尚未停止。'
+    reset_run reset-apply "$reset_token" ||
+        fail '未能確認重設結果。應用保持停止，請先查驗資料庫。'
+
+    # 提交後的啟動失敗不能當作重設回滾，分開回報兩個結果。
+    docker_local start "$reset_app" >/dev/null ||
+        fail '資料已重設，但應用未啟動。請執行 ./bin/start。'
+    reset_wait=0
+    while [ "$reset_wait" -lt 60 ]; do
+        reset_state=$(docker_local container inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$reset_app") ||
+            fail '資料已重設，但無法確認應用狀態。'
+        case "$reset_state" in
+            'running|healthy') printf '%s\n' '本機重設完成，請重新登入。'; return 0 ;;
+            running\|*) ;;
+            *) fail '資料已重設，但應用已停止。請執行 ./bin/start。' ;;
+        esac
+        reset_wait=$((reset_wait + 1))
+        sleep 1
+    done
+    fail '資料已重設，但應用尚未就緒。請檢查本案容器。'
+}
+
+if [ "$operation" = 重設 ]; then
+    private_state || fail '.local 必須是權限 0700 的本機目錄。'
+    private_file .local/db-password && private_file .local/demo-passwords.json ||
+        fail '必須提供既有權限 0600 的資料庫及示範帳號憑證。'
+    reset_project
+    exit 0
+fi
+
 if [ ! -e .local ] && [ ! -L .local ]; then
     mkdir -m 700 .local || [ -d .local ]
 fi
-# 確認狀態目錄屬於預期的本機路徑，避免掛載可被其他帳號存取的目錄。
-if [ ! -d .local ] ||
-    [ -L .local ] ||
-    [ "$(ls -ld .local | cut -c 1-10)" != "drwx------" ]; then
-    printf '%s\n' '啟動失敗：.local 必須是權限 0700 的本機目錄。' >&2
-    exit 1
-fi
+private_state || fail '.local 必須是權限 0700 的本機目錄。'
+take_operation_lock
 
-# 先完成私密檔案，再以不可覆蓋的方式發布；兩次同時啟動也會沿用同一組密碼。
+# 先完成私密檔案，再以不可覆蓋的方式發布，重複啟動會沿用已發布的密碼。
 if [ ! -e .local/db-password ] && [ ! -L .local/db-password ]; then
     temporary=$(mktemp .local/.db-password.XXXXXX)
-    trap 'rm -f "$temporary"' EXIT
-    trap 'exit 1' HUP INT TERM
     openssl rand -hex 32 > "$temporary"
     if ! ln "$temporary" .local/db-password 2>/dev/null && ! private_file .local/db-password; then
         printf '%s\n' '啟動失敗：無法建立資料庫憑證。' >&2
         exit 1
     fi
     rm -f "$temporary"
-    trap - EXIT HUP INT TERM
+    temporary=
 fi
 if ! private_file .local/db-password; then
     printf '%s\n' '啟動失敗：資料庫憑證必須是權限 0600 的可讀取一般檔案。' >&2

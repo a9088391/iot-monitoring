@@ -53,8 +53,8 @@ const createSchema = `
 `
 
 const createSeedDevices = `
-	INSERT INTO sites (id, name) VALUES ('north', '北區場域'), ('south', '南區場域');
-	INSERT INTO devices (id, name, site_id) VALUES
+	INSERT INTO public.sites (id, name) VALUES ('north', '北區場域'), ('south', '南區場域');
+	INSERT INTO public.devices (id, name, site_id) VALUES
 		('north-01', '北區設備 01', 'north'), ('north-02', '北區設備 02', 'north'), ('north-03', '北區設備 03', 'north'),
 		('south-01', '南區設備 01', 'south'), ('south-02', '南區設備 02', 'south'), ('south-03', '南區設備 03', 'south');
 `
@@ -130,8 +130,20 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	if _, err := tx.ExecContext(ctx, schema); err != nil {
 		return operationFailure("create IoT schema", err)
 	}
+	// 舊版沒有世代表，升級時只建立一次並沿用舊回報的世代 1。
+	hasGeneration, err := hasDataGeneration(ctx, tx)
+	if err != nil {
+		return operationFailure("inspect IoT data generation table", err)
+	}
+	if hasGeneration {
+		if _, err := readDataGeneration(ctx, tx); err != nil {
+			return operationFailure("read IoT data generation", err)
+		}
+	} else if _, err := tx.ExecContext(ctx, createDataGenerationSchema); err != nil {
+		return operationFailure("initialize IoT data generation", err)
+	}
 	var count int
-	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM accounts").Scan(&count); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM public.accounts").Scan(&count); err != nil {
 		return operationFailure("inspect existing demo accounts", err)
 	}
 	passwords, err := demoPasswords(state, count == 0)
@@ -141,41 +153,54 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 
 	// 首次啟動才預載場域、設備及帳號，資料庫只保存密碼雜湊。
 	if count == 0 {
-		if _, err := tx.ExecContext(ctx, createSeedDevices); err != nil {
-			return operationFailure("insert seed sites and devices", err)
+		if err := seedDemoData(ctx, tx, passwords); err != nil {
+			return err
 		}
-		for _, account := range seedAccounts {
-			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO accounts (username, role, site_id, password_hash)
-				VALUES ($1, $2, $3, $4)
-			`, account.username, account.role, account.siteID, hashPassword(passwords[account.username])); err != nil {
-				return operationFailure("insert demo account", err)
-			}
-		}
-	} else {
-		// 重啟時核對既有帳號的角色、場域及密碼，避免憑證檔與資料庫不一致仍啟動。
-		if count != len(seedAccounts) {
-			return errors.New("unexpected demo account count")
-		}
-		for _, account := range seedAccounts {
-			var hash string
-			err := tx.QueryRowContext(ctx, `
-				SELECT password_hash FROM accounts
-				WHERE username = $1 AND role = $2 AND site_id IS NOT DISTINCT FROM $3
-			`, account.username, account.role, account.siteID).Scan(&hash)
-			if err != nil {
-				return operationFailure("inspect existing demo account", err)
-			}
-			if !matchesPassword(hash, passwords[account.username]) {
-				return errors.New("protected demo credentials do not match the database")
-			}
-		}
+	} else if err := verifyDemoAccounts(ctx, tx, count, passwords); err != nil {
+		return err
 	}
 	// 停機期間到期的額度，在接受新請求前清除。
 	if _, err := tx.ExecContext(ctx, pruneLoginAttemptsSQL); err != nil {
 		return operationFailure("prune expired login attempts", err)
 	}
 	return operationFailure("commit seed transaction", tx.Commit())
+}
+
+// seedDemoData 在呼叫端的交易內預載場域、設備與帳號，每次重新產生雜湊的 salt。
+func seedDemoData(ctx context.Context, tx *sql.Tx, passwords map[string]string) error {
+	if _, err := tx.ExecContext(ctx, createSeedDevices); err != nil {
+		return operationFailure("insert seed sites and devices", err)
+	}
+	for _, account := range seedAccounts {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO public.accounts (username, role, site_id, password_hash)
+			VALUES ($1, $2, $3, $4)
+		`, account.username, account.role, account.siteID, hashPassword(passwords[account.username])); err != nil {
+			return operationFailure("insert demo account", err)
+		}
+	}
+	return nil
+}
+
+// verifyDemoAccounts 核對既有帳號的角色、場域及密碼，避免用不相符的憑證啟動或重設。
+func verifyDemoAccounts(ctx context.Context, tx *sql.Tx, count int, passwords map[string]string) error {
+	if count != len(seedAccounts) {
+		return errors.New("unexpected demo account count")
+	}
+	for _, account := range seedAccounts {
+		var hash string
+		err := tx.QueryRowContext(ctx, `
+			SELECT password_hash FROM public.accounts
+			WHERE username = $1 AND role = $2 AND site_id IS NOT DISTINCT FROM $3
+		`, account.username, account.role, account.siteID).Scan(&hash)
+		if err != nil {
+			return operationFailure("inspect existing demo account", err)
+		}
+		if !matchesPassword(hash, passwords[account.username]) {
+			return errors.New("protected demo credentials do not match the database")
+		}
+	}
+	return nil
 }
 
 // readPrivateFile 在受限的根目錄內讀取小型私密設定，只接受權限為 0600 的一般檔案。
