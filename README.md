@@ -1,6 +1,8 @@
-# IoT 設備監控
+# IoT 設備監控與告警 v0.1
 
-本機展示包含兩個場域、六台設備與三個示範帳號。總部可查看全部設備，場域帳號只能查看所屬場域。登入後可查看清單及單台設備資料，也可手動登出。
+本機展示包含兩個場域、六台模擬設備與三個示範帳號。總部可查看全部設備並控制模擬回報，場域帳號只能查看所屬場域。設備溫度、在線狀態與告警會即時更新。異常恢復後，可由有權查看該告警的帳號填寫處理結果並結案。
+
+展示的溫度門檻僅供演示。離線表示在期限內未收到有效回報，畫面無法據此判斷設備是否斷電或網路是否中斷。
 
 ## 啟動與操作
 
@@ -12,7 +14,7 @@
 
 啟動器會在建置前檢查本機 Docker 端點、Compose 專案名稱和既有資源歸屬。若同名資源沒有此工作目錄的歸屬資訊，啟動會中止並保留原資源。
 
-使用 Chrome 或 Chromium 開啟 [http://iot.localhost:18241](http://iot.localhost:18241)。曾用舊的 `127.0.0.1` 網址登入時，切換後需重新登入。瀏覽器仍會依原期限保存舊網址的 Cookie。首次啟動後，可在自己的終端機查看隨機示範密碼。
+使用 Chrome 或 Chromium 手動開啟 [http://iot.localhost:18241](http://iot.localhost:18241)，一般操作只需一個視窗。曾用舊的 `127.0.0.1` 網址登入時，切換後需重新登入。瀏覽器仍會依原期限保存舊網址的 Cookie。首次啟動後，可在自己的終端機查看隨機示範密碼。
 
 ```sh
 cat .local/demo-passwords.json
@@ -24,7 +26,7 @@ cat .local/demo-passwords.json
 | `north` | 北區，三台 |
 | `south` | 南區，三台 |
 
-以任一帳號登入，選擇設備可查看詳細資料。登出後換另一個帳號，即可比較可見範圍。登入八小時後到期。登入嘗試受每帳號每分鐘五次與每來源每分鐘三十次的限制。 配額以 PostgreSQL 的 60 秒滾動視窗計算，重啟會沿用未到期的紀錄。
+以任一帳號登入，選擇設備可查看詳細資料。登出後換另一個帳號，即可比較可見範圍。登入八小時後到期。登入嘗試受每帳號每分鐘五次與每來源每分鐘三十次的限制。配額以 PostgreSQL 的 60 秒滾動視窗計算，重啟會沿用未到期的紀錄。
 
 以 `hq` 登入並開啟設備詳情，即可控制模擬回報。開始正常或異常回報時，設備會立即送出 23°C 或 30°C，之後每五秒回報。停止只停止產生新測量，畫面仍顯示最新有效溫度。重複回報會原樣重送最近一筆原始測量。若畫面提示狀態已變更，請確認讀回的新模式，再手動操作。
 
@@ -34,7 +36,52 @@ cat .local/demo-passwords.json
 
 登入後，設備和告警畫面會自動讀回已提交的變更。畫面顯示即時連線及同步狀態。斷線期間可辨識資料可能過時。連線恢復後，系統會重新取得目前畫面的快照。需要時可用「重新同步」立即再試。
 
-用 `docker compose stop` 停止服務，用 `./bin/start` 再啟動。PostgreSQL 資料保存在本專案的 `data` 資料卷，`.local/` 保存在本機。請一併保留資料卷與 `.local/` 以便重啟，並妥善保管憑證。若啟動失敗，執行 `docker compose ps` 檢查服務狀態，或執行 `docker compose logs app db` 查看啟動原因。
+要停止服務，請在啟動時使用的專案根目錄與 Docker 環境執行下列指令。指令先核對兩個容器的工作目錄、設定檔、專案與服務標籤，再用核對過的 ID 依序停止應用與資料庫。
+
+```sh
+(
+  set -eu
+  if [ -n "${DOCKER_CONTEXT:-}" ] || [ -z "${DOCKER_HOST:-}" ]; then
+    unset DOCKER_HOST
+    context=$(docker context show)
+    endpoint=$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}')
+  else
+    endpoint=$DOCKER_HOST
+  fi
+  case "$endpoint" in
+    unix:///?*) ;;
+    *) printf '%s\n' '需要與啟動時相同的本機 Docker Unix socket。' >&2; exit 1 ;;
+  esac
+  unset DOCKER_CONTEXT DOCKER_HOST
+  root=$(pwd -P)
+  project=iot-monitoring
+  owned_id() {
+    service=$1
+    inspected=$(docker --host "$endpoint" container inspect --format \
+      '{{.Id}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.project.config_files"}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+      "$project-$service-1") || return 1
+    if [ "${inspected#*|}" != "$root|$root/compose.yaml|$project|$service" ]; then
+      printf '%s\n' 'Compose 容器不屬於目前的工作目錄。' >&2
+      return 1
+    fi
+    printf '%s\n' "${inspected%%|*}"
+  }
+  app_id=$(owned_id app)
+  db_id=$(owned_id db)
+  docker --host "$endpoint" container stop "$app_id"
+  docker --host "$endpoint" container stop "$db_id"
+)
+```
+
+用 `./bin/start` 再啟動。PostgreSQL 資料保存在本專案的 `data` 資料卷，`.local/` 保存在本機。請一併保留並妥善保管憑證。若要查閱狀態或日誌，使用同一個 Docker 端點和已核對的容器 ID 執行 `docker container inspect` 或 `docker container logs`。
+
+## 展示流程
+
+1. 啟動服務並以 `hq` 登入。選擇「北區設備 01」，按「開始異常回報」，確認設備在線且最新有效溫度為 30°C。到「告警歷程」找到該設備本次的「溫度異常」，記下編號並確認「異常持續中」。
+2. 回到同一台設備按「停止回報」。等畫面顯示「離線」及「資料已非即時」，最後有效溫度仍為 30°C。再按「開始異常回報」，確認恢復在線，且同一編號的溫度告警仍為「異常持續中」。
+3. 回到設備按「開始正常回報」，確認溫度更新為 23°C。回到「告警歷程」開啟剛才記下的告警，確認「已恢復、待結案」。輸入展示用處理結果並按「結案」，確認畫面顯示「已結案」和原文。
+4. 依上方指令停止並再啟動服務。重新載入網頁，確認設備的模擬模式為「已停止」、最近有效溫度仍為 23°C，且告警歷程可讀回同一筆結案和處理結果。
+5. 若這份資料可清除，再依下節執行重設。確認舊頁面要求重新登入。用原密碼登入後，設備顯示「尚未回報」，告警歷程為空。
 
 ## 本機展示重設
 
@@ -114,7 +161,7 @@ data: {"version":"12","viewer":"<session-view>","expiresAt":"2026-01-01T00:00:00
 準備 Node.js 24.22.2、正在執行的本機 Docker，以及 Chrome 或 Chromium。若瀏覽器安裝於其他位置，可用 `CHROME_EXECUTABLE` 指定執行檔。
 
 ```sh
-(cd tests && npm ci && npm test)
+(cd tests && npm ci && npm test -- --test-concurrency=1)
 ```
 
 測試透過 `./bin/start` 建置和啟動獨立 Compose 專案，以真實 PostgreSQL、HTTP 和 Chrome 驗證登入防護、場域權限、重啟及瀏覽器操作。測試會使用自己的暫存目錄、連接埠和資料卷，並在結束時清理。已在 macOS arm64、OrbStack Docker Engine 29.8.2、Compose 5.5.0 與 Chrome 156.0.8078.82 驗證。
@@ -143,3 +190,17 @@ caffeinate -di node tests/performance.js
 指令會印出證據目錄。以其中的 `report.json` 判讀 `PASS`、`FAIL` 或 `INCOMPLETE`，並查閱逐筆採用、繪製、時基區間、容器配額與主機紀錄。每筆必要顯示以含校時誤差的延遲上界核對兩秒門檻。缺樣、超時、拒絕及漏排程均會保留。只有正式量測通過會以結束碼 0 返回。
 
 可加 `--probe` 核對隔離堆疊、配額、校時和十個真實視窗是否可用。探查不送出正式負載，即使 `probePassed` 為真，仍回報 `INCOMPLETE`。測試結束後清理本次隔離容器與資料卷，證據目錄保留。
+
+### 已量測的效能結果
+
+本機效能驗收使用 Apple M3（arm64）與 24 GiB 記憶體、OrbStack Docker Engine 29.8.2、Compose 5.5.0、Node.js 24.22.2、Chrome 156.0.8078.82。應用及 PostgreSQL 容器各為 2 vCPU／2 GiB。暖機採用 1,200 筆，300 秒正式區間採用 6,000／6,000 筆。10 個可見視窗的 24,018／24,018 筆必要畫面更新均有逐列證據，無漏排程、缺樣或逾時。另送兩筆無效資料，兩筆均遭拒絕。
+
+| 項目 | 最慢觀測值（秒，向上取至小數第三位） | 門檻 |
+| --- | ---: | ---: |
+| 溫度顯示 | 0.547 | 2 秒 |
+| 溫度告警顯示 | 0.227 | 2 秒 |
+| 離線狀態／告警顯示 | 1.782／1.773 | 2 秒 |
+| 恢復在線顯示 | 0.223 | 2 秒 |
+| 視窗恢復觀看後同步 50 列 | 0.830 | 2 秒 |
+
+正式量測結果為 `PASS`。完成量測後補上的啟動中止保護另以正常原生短測及啟動卡住後中止實測。正式取證、時基校正與判分沿用這次量測結果。可使用上方指令在自己的機器產生完整逐筆報告。

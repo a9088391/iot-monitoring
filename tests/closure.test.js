@@ -442,11 +442,15 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     assert.equal(await row(northUnknown).count(), 0)
     await row(southRecovered).click()
     await input.fill('登入失效前的草稿')
-    // 只調整隔離測試的南區登入期限，讓原畫面送出時收到真正 401。
-    assert.equal(stack.sql(`
-      UPDATE sessions SET expires_at = statement_timestamp()
-      WHERE username = 'south' RETURNING 1;
-    `), '1')
+    // 等結案請求送出再讓隔離的南區登入到期，避免背景讀取先清除草稿。
+    await page.route(stack.origin + closePath(southRecovered), async route => {
+      assert.equal(route.request().method(), 'POST')
+      assert.equal(stack.sql(`
+        UPDATE sessions SET expires_at = statement_timestamp()
+        WHERE username = 'south' RETURNING 1;
+      `), '1')
+      await route.continue()
+    }, { times: 1 })
     const expired = await submitResponse(southRecovered)
     assert.deepEqual(await json(expired, 401, '結案期間登入失效'), { error: 'unauthenticated' })
     await accountMessage.waitFor()
