@@ -8,15 +8,22 @@ import (
 )
 
 type alertItem struct {
-	ID                string     `json:"id"`
-	DeviceID          string     `json:"deviceId"`
-	Type              string     `json:"type"`
-	Status            string     `json:"status"`
-	Temperature       *float64   `json:"temperature,omitempty"`
-	DetectedAt        time.Time  `json:"detectedAt"`
-	RecoveredAt       *time.Time `json:"recoveredAt"`
-	DeadlineAt        *time.Time `json:"deadlineAt,omitempty"`
-	DetectedAtRestart *bool      `json:"detectedAtRestart,omitempty"`
+	ID                string        `json:"id"`
+	DeviceID          string        `json:"deviceId"`
+	Type              string        `json:"type"`
+	Status            string        `json:"status"`
+	Temperature       *float64      `json:"temperature,omitempty"`
+	DetectedAt        time.Time     `json:"detectedAt"`
+	RecoveredAt       *time.Time    `json:"recoveredAt"`
+	DeadlineAt        *time.Time    `json:"deadlineAt,omitempty"`
+	DetectedAtRestart *bool         `json:"detectedAtRestart,omitempty"`
+	Closure           *alertClosure `json:"closure,omitempty"`
+}
+
+type alertClosure struct {
+	Actor    string    `json:"actor"`
+	ClosedAt time.Time `json:"closedAt"`
+	Result   string    `json:"result"`
 }
 
 type alertPage struct {
@@ -32,22 +39,34 @@ type rowScanner interface {
 
 const alertSource = `
 	FROM alerts a JOIN devices d ON d.id = a.device_id
+	LEFT JOIN alert_closures c ON c.alert_id = a.id
 	WHERE ($1::text IS NULL OR d.site_id = $1)
 `
 
 const alertColumns = `
 	SELECT a.id, a.device_id, a.type, a.temperature, a.detected_at_ns, a.recovered_at_ns,
-		a.deadline_at_ns, a.detected_at_restart
+		a.deadline_at_ns, a.detected_at_restart, c.actor, c.closed_at_ns, c.result
 `
 
-// scanAlert 將資料列轉成 API 告警。只有離線告警有逾時證據，恢復時間則決定告警狀態。
+// parseAlertID 沿用告警明細的正整數 ID 格式，無效時以不存在的 ID 表示。
+func parseAlertID(raw string) int64 {
+	id, err := strconv.ParseUint(raw, 10, 63)
+	if err != nil {
+		return 0
+	}
+	return int64(id)
+}
+
+// scanAlert 保留告警的原始證據，依恢復與結案紀錄決定狀態。
 func scanAlert(row rowScanner) (alertItem, error) {
 	var item alertItem
 	var id, detected int64
 	var temperature sql.NullFloat64
-	var recovered, deadline sql.NullInt64
+	var recovered, deadline, closedAt sql.NullInt64
 	var restart bool
-	if err := row.Scan(&id, &item.DeviceID, &item.Type, &temperature, &detected, &recovered, &deadline, &restart); err != nil {
+	var actor, result sql.NullString
+	if err := row.Scan(&id, &item.DeviceID, &item.Type, &temperature, &detected, &recovered,
+		&deadline, &restart, &actor, &closedAt, &result); err != nil {
 		return alertItem{}, err
 	}
 	// 以字串保留整數 ID 的完整精度，時間統一轉為 UTC。
@@ -65,6 +84,10 @@ func scanAlert(row rowScanner) (alertItem, error) {
 	if recovered.Valid {
 		item.RecoveredAt = new(time.Unix(0, recovered.Int64).UTC())
 		item.Status = "recovered"
+	}
+	if closedAt.Valid {
+		item.Status = "closed"
+		item.Closure = &alertClosure{actor.String, time.Unix(0, closedAt.Int64).UTC(), result.String}
 	}
 	return item, nil
 }

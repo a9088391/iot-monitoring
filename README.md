@@ -30,13 +30,15 @@ cat .local/demo-passwords.json
 
 在設備詳情按「重新載入設備狀態」，可查看目前是否在線。設備從未啟動時顯示「尚未回報」，首次啟動後會等待首筆回報。背景檢查在距最後有效回報或首筆期待起點超過十五秒後判定離線。離線時保留最後有效溫度與臺灣時間，並標示「資料已非即時」。
 
+登入後選擇「告警歷程」查看目前帳號有權查閱的告警。異常持續中的告警只可查閱。恢復後可選取該筆告警、輸入 1～2,000 個 Unicode 字元的非空白處理結果，再按「結案」。已結案的處理人、臺灣時間及結果為唯讀。若操作結果未確認，請先讀回該筆告警再決定是否重試。
+
 用 `docker compose stop` 停止服務，用 `./bin/start` 再啟動。PostgreSQL 資料保存在本專案的 `data` 資料卷，`.local/` 保存在本機。請一併保留資料卷與 `.local/` 以便重啟，並妥善保管憑證。若啟動失敗，執行 `docker compose ps` 檢查服務狀態，或執行 `docker compose logs app db` 查看啟動原因。
 
 ## 架構與開發
 
 - Go 1.27.3／Gin 1.12.0 提供 API 和 Vue 靜態檔案。伺服器依 session 決定場域，並使用 PostgreSQL 啟動鎖限制為單一實例。
-- Vue 3.5.45／TypeScript 6.0.3／Vite 8.3.6 提供同來源的登入和設備查詢介面。瀏覽器透過限定於 `iot.localhost` 主機的 `HttpOnly`、`SameSite=Strict` Cookie 使用伺服器端 session。
-- PostgreSQL 18.6 保存帳號雜湊、場域、設備、session、每台設備的最新測量、溫度與離線告警，以及模擬控制歷程。Compose 只將網站發布到 `127.0.0.1`，資料庫留在 Compose 網路。這套 HTTP 設定供本機展示使用。
+- Vue 3.5.45／TypeScript 6.0.3／Vite 8.3.6 提供同來源的登入、設備查詢及告警歷程介面。瀏覽器透過限定於 `iot.localhost` 主機的 `HttpOnly`、`SameSite=Strict` Cookie 使用伺服器端 session。
+- PostgreSQL 18.6 保存帳號雜湊、場域、設備、session、每台設備的最新測量、溫度與離線告警、結案紀錄及模擬控制歷程。Compose 只將網站發布到 `127.0.0.1`，資料庫留在 Compose 網路。這套 HTTP 設定供本機展示使用。
 
 前端依賴及映像均已固定於 lockfile、`Dockerfile` 與 `compose.yaml`。本機開發檢查可使用 Go 1.27.3 和 Node.js 24.22.2。
 
@@ -70,6 +72,10 @@ Content-Type: application/json
 
 低於 18°C 或高於 28°C 會建立一筆溫度告警。同設備持續超標沿用該筆，收到 18～28°C 回報後標記恢復。恢復後再超標會建立新告警。
 
+告警歷程依 ID 倒序分頁，狀態為 `active`、`recovered` 或 `closed`。已恢復的告警可用 `POST /api/alerts/:id/close` 提交 `{"result":"處理結果"}`，沿用登入 Cookie、同源 Origin 與 CSRF 標頭。成功回傳 `200` 及完整告警，新增 `closure` 欄位內的 `actor`、UTC `closedAt` 和純文字 `result`。
+
+`409 alert_conflict` 表示該筆仍在異常中或已有結案。其他場域的 ID 與不存在的 ID 都回傳 `404 not_found`。資料庫無法提交時回傳 `503 service_unavailable`。結案不影響同設備另一筆異常，也不覆寫既有結案結果。
+
 ## 端到端測試
 
 準備 Node.js 24.22.2、正在執行的本機 Docker，以及 Chrome 或 Chromium。若瀏覽器安裝於其他位置，可用 `CHROME_EXECUTABLE` 指定執行檔。
@@ -86,4 +92,5 @@ Content-Type: application/json
 ./bin/test-measurements
 ./bin/test-measurements simulation
 ./bin/test-measurements offline
+./bin/test-measurements closure
 ```

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import AlertHistory from './AlertHistory.vue'
 
 type Identity = {
   username: string
@@ -64,7 +65,8 @@ const loginMessage = ref('')
 const loginPending = ref(false)
 const logoutPending = ref(false)
 const logoutUnconfirmed = ref(false)
-const view = ref<'list' | 'detail'>('list')
+const view = ref<'list' | 'detail' | 'alerts'>('list')
+const alertPending = ref(false)
 const devices = ref<Device[]>([])
 const total = ref(0)
 const offset = ref(0)
@@ -168,6 +170,7 @@ function clearProtectedState(): number {
   detailError.value = ''
   detailCanRetry.value = false
   clearSimulation()
+  alertPending.value = false
   loginPending.value = false
   logoutPending.value = false
   logoutUnconfirmed.value = false
@@ -180,10 +183,10 @@ function isAbort(error: unknown): boolean {
 }
 
 // 將可辨識的 API 錯誤轉為操作提示，其餘保留呼叫端提供的情境訊息。
-function apiMessage(error: unknown, fallback: string): string {
+function apiMessage(error: unknown, fallback: string, notFound = '找不到這台設備，或您沒有權限查看。'): string {
   if (!(error instanceof ApiError)) return fallback
   if (error.status === 403 || error.code === 'forbidden') return '此操作未獲允許。'
-  if (error.status === 404 || error.code === 'not_found') return '找不到這台設備，或您沒有權限查看。'
+  if (error.status === 404 || error.code === 'not_found') return notFound
   if (error.status === 429 || error.code === 'rate_limited') return '登入嘗試次數已達限制，請稍後再試。'
   if (error.status === 503 || error.code === 'service_unavailable') return '服務暫時無法使用，請稍後重試。'
   return fallback
@@ -195,6 +198,14 @@ function expireSession(generation: number): void {
   clearProtectedState()
   initialized.value = true
   loginMessage.value = '登入狀態已失效，請重新登入。'
+}
+
+// 讓告警畫面沿用目前登入世代與 API 契約，回應晚到時仍可核對發出請求的身分。
+const alertApi = { readApi, writeApi, apiMessage, expireSession, ApiError, csrfHeaders, isCurrentIdentity }
+
+// 告警操作在 Vue 卸載畫面前也能判定原登入已失效。
+function isCurrentIdentity(generation: number): boolean {
+  return generation === identityGeneration
 }
 
 // 讀取目前身分可見的設備頁面，並以伺服器回傳的分頁資料更新清單。
@@ -518,6 +529,17 @@ function openDevice(id: string): void {
   void loadDevice(id)
 }
 
+// 切換功能時清除設備詳情，並保留原本的設備清單頁碼。
+function navigateTo(section: 'list' | 'alerts'): void {
+  if (
+    !identity.value
+    || alertPending.value
+    || view.value === section
+  ) return
+  if (view.value === 'detail') returnToList()
+  view.value = section
+}
+
 // 掛載時向伺服器查驗身分，卸載時取消查詢並清除受保護資料。
 onMounted(restoreSession)
 onUnmounted(clearProtectedState)
@@ -528,7 +550,11 @@ onUnmounted(clearProtectedState)
     <header class="page-header">
       <div>
         <p class="eyebrow">IoT 設備監控</p>
-        <h1 id="page-title">{{ view === 'detail' ? '設備資料' : '設備清單' }}</h1>
+        <h1 id="page-title">{{ view === 'alerts'
+          ? '告警'
+          : view === 'detail'
+            ? '設備資料'
+            : '設備清單' }}</h1>
       </div>
       <div v-if="identity" class="account">
         <span>{{ identity.username }}（{{ identity.role === 'headquarters' ? '總部' : '場域' }}）</span>
@@ -537,6 +563,11 @@ onUnmounted(clearProtectedState)
         </button>
       </div>
     </header>
+
+    <nav v-if="identity" class="section-nav" aria-label="監控功能">
+      <button type="button" class="button button-secondary" :aria-current="view !== 'alerts' ? 'page' : undefined" :disabled="alertPending" @click="navigateTo('list')">設備清單</button>
+      <button type="button" class="button button-secondary" :aria-current="view === 'alerts' ? 'page' : undefined" :disabled="alertPending" @click="navigateTo('alerts')">告警歷程</button>
+    </nav>
 
     <section v-if="!initialized" class="panel" aria-live="polite">
       <p>正在確認登入狀態…</p>
@@ -626,6 +657,15 @@ onUnmounted(clearProtectedState)
         <button type="button" class="button button-secondary" :disabled="devicesLoading || offset + devices.length >= total" @click="loadDevices(offset + pageSize)">下一頁</button>
       </nav>
     </section>
+
+    <AlertHistory
+      v-else-if="view === 'alerts'"
+      :api="alertApi"
+      :generation="identityGeneration"
+      :receipt-time="receiptTime"
+      :page-size="pageSize"
+      @pending="alertPending = $event"
+    />
 
     <section v-else class="panel" aria-labelledby="device-detail-title">
       <button type="button" class="back-button" @click="returnToList">← 返回設備清單</button>
@@ -740,6 +780,8 @@ input { width: 100%; min-height: 2.8rem; padding: 0.6rem 0.75rem; border: 1px so
 .button-secondary { border-color: #a7b9ab; background: #fff; color: #244d36; }
 .button-secondary:hover:not(:disabled) { background: #f0f5f1; }
 .login-panel .button { margin-top: 0.6rem; }
+.section-nav { display: flex; flex-wrap: wrap; gap: 0.65rem; margin-bottom: 1rem; }
+.section-nav [aria-current] { border-color: #246246; background: #edf5ef; }
 .notice { color: #8a321e; }
 .muted, .device-site { color: #607066; }
 .section-heading { margin-bottom: 1.25rem; }

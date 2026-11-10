@@ -78,6 +78,7 @@ func (a *application) router() http.Handler {
 	api.POST("/devices/:id/simulation", a.simulationControl)
 	api.GET("/alerts", a.alerts)
 	api.GET("/alerts/:id", a.alert)
+	api.POST("/alerts/:id/close", a.alertClose)
 	return router
 }
 
@@ -453,13 +454,13 @@ func (a *application) alert(c *gin.Context) {
 	if !ok {
 		return
 	}
-	id, err := strconv.ParseUint(c.Param("id"), 10, 63)
-	if err != nil || id == 0 {
+	id := parseAlertID(c.Param("id"))
+	if id == 0 {
 		reject(c, http.StatusNotFound, "not_found")
 		return
 	}
 	// 以場域與 ID 一起查詢，維持查無及越權一致的回應。
-	item, err := a.findAlert(c.Request.Context(), user.SiteID, int64(id))
+	item, err := a.findAlert(c.Request.Context(), user.SiteID, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		reject(c, http.StatusNotFound, "not_found")
 		return

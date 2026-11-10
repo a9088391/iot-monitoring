@@ -108,6 +108,15 @@ const addOfflineAlertColumns = `
 		ADD COLUMN IF NOT EXISTS detected_at_restart boolean NOT NULL DEFAULT false;
 `
 
+const createAlertClosureSchema = `
+	CREATE TABLE IF NOT EXISTS alert_closures (
+		alert_id bigint PRIMARY KEY REFERENCES alerts(id),
+		actor text NOT NULL REFERENCES accounts(username),
+		closed_at_ns bigint NOT NULL,
+		result text NOT NULL CHECK (char_length(result) BETWEEN 1 AND 2000)
+	);
+`
+
 // bootstrap 在單一資料庫交易中準備結構及展示資料，並核對重啟前留下的本機憑證。
 func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	tx, err := conn.BeginTx(ctx, nil)
@@ -117,7 +126,8 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	defer tx.Rollback()
 
 	// 套用現有與新增的資料表後，依資料庫是否已有帳號選擇載入或初始化憑證。
-	if _, err := tx.ExecContext(ctx, createSchema+createMeasurementSchema+createSimulationSchema+addOfflineAlertColumns); err != nil {
+	schema := createSchema + createMeasurementSchema + createSimulationSchema + addOfflineAlertColumns + createAlertClosureSchema
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
 		return operationFailure("create IoT schema", err)
 	}
 	var count int
