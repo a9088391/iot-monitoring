@@ -2,6 +2,7 @@
 set -eu
 unset CDPATH
 cd -P "$(dirname "$0")/.."
+# 憑證建立前先收緊預設權限，讓其他本機帳號無法讀取暫存檔。
 umask 077
 port=${IOT_PORT:-18241}
 case "$port" in
@@ -12,6 +13,7 @@ if [ "$port" -gt 65535 ]; then
     exit 1
 fi
 
+# 啟動前置條件失敗就中止，避免沿用不符合本專案要求的資源。
 fail() {
     printf '啟動失敗：%s\n' "$1" >&2
     exit 1
@@ -31,7 +33,9 @@ if [ "$project" != iot-monitoring ]; then
     case "$suffix" in
         *[!0-9a-f]*) fail 'Compose 專案名稱不屬於本專案。' ;;
     esac
-    [ "$project" = "iot01_test_$suffix" ] && [ "${#suffix}" -eq 16 ] && [ "$(dirname "$suite_dir")" = "$tmp_dir" ] &&
+    [ "$project" = "iot01_test_$suffix" ] &&
+        [ "${#suffix}" -eq 16 ] &&
+        [ "$(dirname "$suite_dir")" = "$tmp_dir" ] &&
         [ "$project_root" = "$suite_dir/$project" ] || fail 'Compose 專案名稱不屬於本專案。'
 fi
 
@@ -53,10 +57,12 @@ unset COMPOSE_COMPATIBILITY COMPOSE_ENV_FILES COMPOSE_REMOVE_ORPHANS
 IOT_PROJECT_ROOT=$project_root
 export IOT_PROJECT_ROOT
 
+# 統一使用已驗證的本機 socket，讓歸屬檢查與後續啟動指向同一個 Docker。
 docker_local() {
     docker --host "$endpoint" "$@"
 }
 
+# 同名資源存在時比對專案根目錄標記，避免建置或啟動誤用其他工作目錄的資源。
 check_resource_owner() {
     kind=$1 name=$2 filter=$3 labels=$4 description=$5
     matches=$(docker_local "$kind" ls -q --filter "$filter") || fail "無法檢查 $description。"
@@ -80,15 +86,21 @@ check_resource_owner volume "${project}_data" "name=^${project}_data\$" .Labels 
 check_resource_owner network "${project}_default" "name=^${project}_default\$" .Labels 'Compose 網路'
 check_resource_owner image "${project}-app:latest" "reference=${project}-app:latest" .Config.Labels 'Compose 應用映像'
 
+# 憑證須有內容且只有擁有者可讀寫，同時拒絕經由符號連結讀取其他檔案。
 private_file() {
-    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] && [ -s "$1" ] &&
+    [ -f "$1" ] &&
+        [ ! -L "$1" ] &&
+        [ -r "$1" ] &&
+        [ -s "$1" ] &&
         [ "$(ls -ld "$1" | cut -c 1-10)" = "-rw-------" ]
 }
 
 if [ ! -e .local ] && [ ! -L .local ]; then
     mkdir -m 700 .local || [ -d .local ]
 fi
-if [ ! -d .local ] || [ -L .local ] ||
+# 確認狀態目錄屬於預期的本機路徑，避免掛載可被其他帳號存取的目錄。
+if [ ! -d .local ] ||
+    [ -L .local ] ||
     [ "$(ls -ld .local | cut -c 1-10)" != "drwx------" ]; then
     printf '%s\n' '啟動失敗：.local 必須是權限 0700 的本機目錄。' >&2
     exit 1
@@ -112,6 +124,7 @@ if ! private_file .local/db-password; then
     exit 1
 fi
 
+# 先用本機預設建置器產出映像，啟動時沿用該映像並等待服務就緒。
 docker_local compose --env-file /dev/null -p "$project" -f "$project_root/compose.yaml" build --builder default
 docker_local compose --env-file /dev/null -p "$project" -f "$project_root/compose.yaml" up --no-build --wait
 printf 'IoT 設備監控已啟動：http://iot.localhost:%s\n' "$port"

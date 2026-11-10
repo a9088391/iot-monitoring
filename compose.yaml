@@ -6,6 +6,7 @@ services:
       POSTGRES_DB: iot
       POSTGRES_USER: iot
       POSTGRES_PASSWORD_FILE: /run/secrets/iot-db-password
+    # 資料卷跨容器重啟保留，資料庫密碼則讀取啟動腳本建立的唯讀檔案。
     volumes:
       - data:/var/lib/postgresql
       - type: bind
@@ -22,24 +23,29 @@ services:
   app:
     build:
       context: .
+      # 啟動腳本以根目錄標籤檢查映像、資料卷與網路歸屬，避免重用其他工作目錄的資源。
       labels:
         io.iot-monitoring.project-root: "${IOT_PROJECT_ROOT:-}"
     environment:
       IOT_DB_HOST: db
       IOT_ORIGIN: http://iot.localhost:${IOT_PORT:-18241}
+    # 本機展示服務僅繫結回送位址，與應用程式驗證的來源網址配合。
     ports:
       - target: 8080
         published: "${IOT_PORT:-18241}"
         host_ip: 127.0.0.1
+    # 將展示帳號憑證存到本機狀態目錄，讓重啟可讀回原檔。
     volumes:
       - type: bind
         source: ./.local
         target: /state
         bind:
           create_host_path: false
+    # 等待資料庫接受連線再啟動應用，讓啟動時的資料庫初始化可立即執行。
     depends_on:
       db:
         condition: service_healthy
+    # 健康檢查帶入預期 Host，才能通過應用程式的來源檢查。
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null --header \"Host: $${IOT_ORIGIN#http://}\" http://127.0.0.1:8080/healthz"]
       interval: 2s

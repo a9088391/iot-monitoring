@@ -28,13 +28,15 @@ cat .local/demo-passwords.json
 
 以 `hq` 登入並開啟設備詳情，即可控制模擬回報。開始正常或異常回報時，設備會立即送出 23°C 或 30°C，之後每五秒回報。停止只停止產生新測量，畫面仍顯示最新有效溫度。重複回報會原樣重送最近一筆原始測量。若畫面提示狀態已變更，請確認讀回的新模式，再手動操作。
 
+在設備詳情按「重新載入設備狀態」，可查看目前是否在線。設備從未啟動時顯示「尚未回報」，首次啟動後會等待首筆回報。背景檢查在距最後有效回報或首筆期待起點超過十五秒後判定離線。離線時保留最後有效溫度與臺灣時間，並標示「資料已非即時」。
+
 用 `docker compose stop` 停止服務，用 `./bin/start` 再啟動。PostgreSQL 資料保存在本專案的 `data` 資料卷，`.local/` 保存在本機。請一併保留資料卷與 `.local/` 以便重啟，並妥善保管憑證。若啟動失敗，執行 `docker compose ps` 檢查服務狀態，或執行 `docker compose logs app db` 查看啟動原因。
 
 ## 架構與開發
 
 - Go 1.27.3／Gin 1.12.0 提供 API 和 Vue 靜態檔案。伺服器依 session 決定場域，並使用 PostgreSQL 啟動鎖限制為單一實例。
 - Vue 3.5.45／TypeScript 6.0.3／Vite 8.3.6 提供同來源的登入和設備查詢介面。瀏覽器透過限定於 `iot.localhost` 主機的 `HttpOnly`、`SameSite=Strict` Cookie 使用伺服器端 session。
-- PostgreSQL 18.6 保存帳號雜湊、場域、設備、session、每台設備的最新測量、溫度告警與模擬控制歷程。Compose 只將網站發布到 `127.0.0.1`，資料庫留在 Compose 網路。這套 HTTP 設定供本機展示使用。
+- PostgreSQL 18.6 保存帳號雜湊、場域、設備、session、每台設備的最新測量、溫度與離線告警，以及模擬控制歷程。Compose 只將網站發布到 `127.0.0.1`，資料庫留在 Compose 網路。這套 HTTP 設定供本機展示使用。
 
 前端依賴及映像均已固定於 lockfile、`Dockerfile` 與 `compose.yaml`。本機開發檢查可使用 Go 1.27.3 和 Node.js 24.22.2。
 
@@ -64,6 +66,8 @@ Content-Type: application/json
 
 登入後可透過 `GET /api/devices` 和 `GET /api/devices/:id` 讀取已採用的 `latestMeasurement`，其中 `receivedAt` 是入列前的抵達時間。`GET /api/alerts` 提供告警清單，`GET /api/alerts/:id` 讀取單筆告警。場域帳號只能讀取本場域，總部可跨場域查閱。清單以 `limit` 和 `offset` 分頁，預設 50 筆，最多 100 筆。
 
+設備的 `onlineStatus` 為 `unreported`、`awaiting`、`online` 或 `offline`。離線告警的 `deadlineAt` 記錄回報期限，`detectedAt` 記錄服務何時發現，`detectedAtRestart` 標示是否在重啟時補判。服務在停機期間無法即時偵測設備。有效回報恢復在線時，溫度告警仍依該筆溫度獨立判定。
+
 低於 18°C 或高於 28°C 會建立一筆溫度告警。同設備持續超標沿用該筆，收到 18～28°C 回報後標記恢復。恢復後再超標會建立新告警。
 
 ## 端到端測試
@@ -81,4 +85,5 @@ Content-Type: application/json
 ```sh
 ./bin/test-measurements
 ./bin/test-measurements simulation
+./bin/test-measurements offline
 ```

@@ -36,23 +36,28 @@ type measurementTestDatabase struct {
 	startedAt time.Time
 }
 
+// openMeasurementTestDatabase 只連測試腳本啟用的本機測試庫，另記錄叢集及程序身分供重啟驗證。
 func openMeasurementTestDatabase(t *testing.T) measurementTestDatabase {
 	t.Helper()
 	if os.Getenv("IOT_MEASUREMENT_TEST") != "1" {
 		t.Skip("run bin/test-measurements for a disposable PostgreSQL instance")
 	}
+	// 只經 Unix socket 連指定資料庫，避免把測試寫入一般服務。
 	ctx := t.Context()
 	config, err := pgx.ParseConfig("host=/var/run/postgresql port=5432 user=iot dbname=iot_measurement_test sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
 	}
 	db := stdlib.OpenDB(*config)
+	// 註冊清理讓個別連線先歸還，再關閉連線池。
 	t.Cleanup(func() { db.Close() })
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 測試結束時釋放此專用連線。
 	t.Cleanup(func() { conn.Close() })
+	// 查驗資料庫名稱、角色、socket 及叢集識別，再供各案例使用。
 	var database, user string
 	var local bool
 	target := measurementTestDatabase{pool: db, conn: conn}
@@ -61,13 +66,17 @@ func openMeasurementTestDatabase(t *testing.T) measurementTestDatabase {
 			(SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace),
 			(SELECT system_identifier FROM pg_control_system()), pg_postmaster_start_time()
 	`).Scan(&database, &user, &local, &target.pid, &target.relations, &target.clusterID, &target.startedAt)
-	if err != nil || database != "iot_measurement_test" || user != "iot" || !local {
+	if err != nil ||
+		database != "iot_measurement_test" ||
+		user != "iot" ||
+		!local {
 		t.Fatalf("expected disposable socket database, got database=%q user=%q socket=%v: %v",
 			database, user, local, err)
 	}
 	return target
 }
 
+// openMeasurementTestState 在測試容器使用私密狀態目錄，讓重啟前後安全交換證據。
 func openMeasurementTestState(t *testing.T, create bool) *os.Root {
 	t.Helper()
 	if create {
@@ -75,6 +84,7 @@ func openMeasurementTestState(t *testing.T, create bool) *os.Root {
 			t.Fatal(err)
 		}
 	}
+	// 拒絕非 0700 目錄，測試結束時關閉受限的根目錄。
 	info, err := os.Lstat(measurementTestState)
 	if err != nil {
 		t.Fatal(err)
@@ -86,15 +96,18 @@ func openMeasurementTestState(t *testing.T, create bool) *os.Root {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 測試結束時關閉目錄，讓後續重啟測試另行開啟。
 	t.Cleanup(func() { state.Close() })
 	return state
 }
 
+// newMeasurementFixture 以指定資料庫連線及真實 HTTP 路由建立測量測試。
 func newMeasurementFixture(t *testing.T, conn *sql.Conn) *measurementFixture {
 	t.Helper()
 	return serveMeasurementFixture(t, measurementTestApplication(conn))
 }
 
+// measurementTestApplication 重用正式的連線序列化和登入槽位，測試只替換外部依賴。
 func measurementTestApplication(conn *sql.Conn) *application {
 	return &application{
 		host: "iot.localhost:8090", origin: measurementTestOrigin,
@@ -102,6 +115,7 @@ func measurementTestApplication(conn *sql.Conn) *application {
 	}
 }
 
+// serveMeasurementFixture 以測試伺服器執行正式路由，並限制等待時間及測試結束後關閉。
 func serveMeasurementFixture(t *testing.T, app *application) *measurementFixture {
 	t.Helper()
 	f := &measurementFixture{app: app}
@@ -117,6 +131,7 @@ type measurementRestartEvidence struct {
 	API       string
 }
 
+// TestMeasurementIntegration 經實際採用入口及 HTTP 驗證新鮮度、溫度告警與交易一致性。
 func TestMeasurementIntegration(t *testing.T) {
 	target := openMeasurementTestDatabase(t)
 	if target.relations != 0 {
@@ -138,10 +153,11 @@ func TestMeasurementIntegration(t *testing.T) {
 		t.Fatalf("unexpected empty alerts page: %s", empty)
 	}
 	beforeMeasurement := f.get(t, "/api/devices/north-01")
-	if string(beforeMeasurement) != `{"id":"north-01","name":"北區設備 01","siteId":"north","siteName":"北區場域"}` {
+	if string(beforeMeasurement) != `{"id":"north-01","name":"北區設備 01","siteId":"north","siteName":"北區場域","onlineStatus":"unreported"}` {
 		t.Fatalf("unexpected untouched device payload: %s", beforeMeasurement)
 	}
 
+	// 先用恰好五秒的樣本驗證未註冊執行被拒，再以同樣本確認已註冊時可採用。
 	now := time.Date(2026, 11, 9, 10, 0, 0, 123456789, time.UTC)
 	f.clock.Store(now.UnixNano())
 	f.app.measurementNow = f.now
@@ -169,16 +185,24 @@ func TestMeasurementIntegration(t *testing.T) {
 		t.Fatalf("initial high measurement did not open one alert: %+v", firstPage)
 	}
 	first := firstPage.Items[0]
-	if first.ID == "" || first.DeviceID != "north-01" || first.Type != "temperature" || first.Status != "active" ||
-		first.Temperature != 30 || first.DetectedAt != "2026-11-09T10:00:00.123456789Z" || first.RecoveredAt != nil {
+	if first.ID == "" ||
+		first.DeviceID != "north-01" ||
+		first.Type != "temperature" ||
+		first.Status != "active" ||
+		first.Temperature != 30 ||
+		first.DetectedAt != "2026-11-09T10:00:00.123456789Z" ||
+		first.RecoveredAt != nil {
 		t.Fatalf("unexpected initial high alert: %+v", first)
 	}
 
+	// 建立持續超標的基準，後續每個無效樣本都不得改動設備或告警。
 	sample.Sequence++
 	sample.GeneratedAt = now.Add(-time.Second)
 	f.submit(t, sample, true)
 	baseline := f.snapshot(t)
+	// 逐項破壞原本有效的測量，核對每次略過都保留完整快照。
 	if !t.Run("invalid samples preserve measurements and alerts", func(t *testing.T) {
+		// 每個回呼只改動案例指定的欄位，隔離各自的拒絕原因。
 		for _, invalid := range []struct {
 			name string
 			edit func(*Measurement)
@@ -202,6 +226,7 @@ func TestMeasurementIntegration(t *testing.T) {
 			{"future at arrival", func(m *Measurement) { m.GeneratedAt = now.Add(time.Nanosecond) }},
 			{"expired at arrival", func(m *Measurement) { m.GeneratedAt = now.Add(-5*time.Second - time.Nanosecond) }},
 		} {
+			// 每次從相同有效基準複製樣本，經入口提交後讀回確認無副作用。
 			t.Run(invalid.name, func(t *testing.T) {
 				input := sample
 				input.Sequence, input.Temperature = 2, 23
@@ -217,14 +242,17 @@ func TestMeasurementIntegration(t *testing.T) {
 	}
 
 	var recoveredFirst measurementAlertWire
+	// 驗證正常邊界可恢復告警，且恢復後的異常建立新紀錄。
 	if !t.Run("inclusive thresholds and independent episodes", func(t *testing.T) {
 		// 較新順序可使用相同生成時間，兩端正常值都不能建立告警。
 		sample.Sequence, sample.Temperature = 2, 18
 		f.clock.Add(int64(time.Nanosecond))
 		f.submit(t, sample, true)
 		recoveredFirst = f.alert(t, first.ID)
-		if recoveredFirst.Status != "recovered" || recoveredFirst.Temperature != 30 ||
-			recoveredFirst.RecoveredAt == nil || *recoveredFirst.RecoveredAt != "2026-11-09T10:00:00.12345679Z" {
+		if recoveredFirst.Status != "recovered" ||
+			recoveredFirst.Temperature != 30 ||
+			recoveredFirst.RecoveredAt == nil ||
+			*recoveredFirst.RecoveredAt != "2026-11-09T10:00:00.12345679Z" {
 			t.Fatalf("18°C did not recover first episode: %+v", recoveredFirst)
 		}
 		sample.Sequence, sample.Temperature = 3, 28
@@ -232,10 +260,14 @@ func TestMeasurementIntegration(t *testing.T) {
 		if page := f.page(t, ""); page.Total != 1 || !slices.EqualFunc(page.Items, []measurementAlertWire{recoveredFirst}, sameMeasurementAlert) {
 			t.Fatalf("28°C changed alert history: %+v", page)
 		}
+		// 跨過下限會產生新告警，持續異常即使跨到上限外也沿用同筆。
 		sample.Sequence, sample.Temperature = 4, 17.99
 		f.submit(t, sample, true)
 		low := f.page(t, "").Items[0]
-		if low.ID == first.ID || low.Status != "active" || low.Temperature != 17.99 || low.RecoveredAt != nil {
+		if low.ID == first.ID ||
+			low.Status != "active" ||
+			low.Temperature != 17.99 ||
+			low.RecoveredAt != nil {
 			t.Fatalf("low temperature did not open a new episode: %+v", low)
 		}
 		sample.Sequence, sample.Temperature = 5, 31
@@ -243,6 +275,7 @@ func TestMeasurementIntegration(t *testing.T) {
 		if page := f.page(t, ""); page.Total != 2 || !sameMeasurementAlert(page.Items[0], low) {
 			t.Fatalf("switching abnormal sides changed the ongoing episode: %+v", page)
 		}
+		// 恢復後再超標應新增告警，且兩筆舊紀錄保持各自的恢復資料。
 		sample.Sequence, sample.Temperature = 6, 20
 		f.clock.Add(int64(time.Nanosecond))
 		f.submit(t, sample, true)
@@ -253,8 +286,11 @@ func TestMeasurementIntegration(t *testing.T) {
 		sample.Sequence, sample.Temperature = 7, 30
 		f.submit(t, sample, true)
 		page := f.page(t, "")
-		if page.Total != 3 || page.Items[0].ID == low.ID || page.Items[0].ID == first.ID ||
-			page.Items[0].Status != "active" || !sameMeasurementAlert(page.Items[1], recoveredLow) ||
+		if page.Total != 3 ||
+			page.Items[0].ID == low.ID ||
+			page.Items[0].ID == first.ID ||
+			page.Items[0].Status != "active" ||
+			!sameMeasurementAlert(page.Items[1], recoveredLow) ||
 			!sameMeasurementAlert(page.Items[2], recoveredFirst) {
 			t.Fatalf("recurrence modified previous recovery or reused its ID: %+v", page)
 		}
@@ -262,6 +298,7 @@ func TestMeasurementIntegration(t *testing.T) {
 		return
 	}
 
+	// 分開驗證抵達、等待應用層連線及等待資料列鎖時的新鮮度。
 	if !t.Run("receipt and adoption clocks", func(t *testing.T) {
 		existing := f.snapshot(t)
 		sample.Sequence, sample.Temperature = 8, 23
@@ -304,19 +341,38 @@ func TestMeasurementIntegration(t *testing.T) {
 			t.Fatalf("sample expiring during a row lock changed state: %s", got)
 		}
 
+		// 恰好五秒仍可採用。回報時間用抵達時間，離線補記與溫度恢復則核對採用時間。
 		f.delayed(t, sample, received, received.Add(time.Second), true)
 		if got := f.get(t, "/api/devices/north-01"); !strings.Contains(string(got),
 			`"latestMeasurement":{"temperature":23,"sequence":8,"generatedAt":"2026-11-09T10:00:16.123456789Z","receivedAt":"2026-11-09T10:00:20.123456789Z"}`) {
 			t.Fatalf("adoption at the exact boundary lost the arrival timestamp: %s", got)
 		}
-		if latest := f.page(t, "").Items[0]; latest.Status != "recovered" ||
-			latest.RecoveredAt == nil || *latest.RecoveredAt != "2026-11-09T10:00:21.123456789Z" {
-			t.Fatalf("alert did not recover at adoption: %+v", latest)
+		alerts := f.page(t, "").Items
+		if len(alerts) != 4 {
+			t.Fatalf("expected one additional offline alert after late adoption: %+v", alerts)
+		}
+		const adoptionTime = "2026-11-09T10:00:21.123456789Z"
+		offline, temperature := alerts[0], alerts[1]
+		if offline.Type != "offline" ||
+			offline.Status != "recovered" ||
+			offline.DeadlineAt != "2026-11-09T10:00:15.123456791Z" ||
+			offline.DetectedAt != adoptionTime ||
+			offline.RecoveredAt == nil ||
+			*offline.RecoveredAt != adoptionTime ||
+			offline.DetectedAtRestart {
+			t.Fatalf("late receipt did not leave a recovered offline alert: %+v", offline)
+		}
+		if temperature.Type != "temperature" ||
+			temperature.Status != "recovered" ||
+			temperature.RecoveredAt == nil ||
+			*temperature.RecoveredAt != adoptionTime {
+			t.Fatalf("temperature alert did not recover at adoption: %+v", temperature)
 		}
 	}) {
 		return
 	}
 
+	// 讓新增和恢復告警分別違反真實限制，驗證最新測量一併回滾。
 	if !t.Run("alert write failure rolls back latest measurement", func(t *testing.T) {
 		for _, fault := range []struct {
 			check, expectedStatus string
@@ -333,12 +389,16 @@ func TestMeasurementIntegration(t *testing.T) {
 			sample.GeneratedAt, sample.Temperature = f.now(), fault.temperature
 			adopted, err := f.app.SubmitMeasurement(t.Context(), sample)
 			var pgErr *pgconn.PgError
-			if adopted || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "measurement_test_reject" {
+			if adopted ||
+				!errors.As(err, &pgErr) ||
+				pgErr.Code != "23514" ||
+				pgErr.ConstraintName != "measurement_test_reject" {
 				t.Fatalf("expected real alert %s write error with no adoption: adopted=%v error=%v", fault.expectedStatus, adopted, err)
 			}
 			if got := f.snapshot(t); got != existing {
 				t.Fatalf("failed alert %s write left partial changes: %s", fault.expectedStatus, got)
 			}
+			// 移除故障條件後原樣重送，驗證上一筆未部分提交。
 			if _, err := conn.ExecContext(ctx, "ALTER TABLE alerts DROP CONSTRAINT measurement_test_reject"); err != nil {
 				t.Fatal(err)
 			}
@@ -351,6 +411,7 @@ func TestMeasurementIntegration(t *testing.T) {
 		return
 	}
 
+	// 同時提交相同樣本，驗證只有一次採用與一筆新告警。
 	if !t.Run("concurrent duplicate has one adoption", func(t *testing.T) {
 		south := sample
 		south.DeviceID, south.RunID, south.Sequence = "south-01", 13, 0
@@ -359,6 +420,7 @@ func TestMeasurementIntegration(t *testing.T) {
 		for i := range pending {
 			pending[i] = f.submitAsync(t.Context(), south)
 		}
+		// 收齊所有結果再以 API 確認沒有重複告警。
 		adoptions := 0
 		for _, result := range pending {
 			got := <-result
@@ -370,13 +432,17 @@ func TestMeasurementIntegration(t *testing.T) {
 			}
 		}
 		page := f.page(t, "")
-		if adoptions != 1 || page.Total != 5 || page.Items[0].DeviceID != "south-01" || page.Items[0].Status != "active" {
+		if adoptions != 1 ||
+			page.Total != 6 ||
+			page.Items[0].DeviceID != "south-01" ||
+			page.Items[0].Status != "active" {
 			t.Fatalf("concurrent retries did not produce one adoption and one new alert: adoptions=%d page=%+v", adoptions, page)
 		}
 	}) {
 		return
 	}
 
+	// 先確認權限及分頁，再重跑初始化並重送舊樣本，核對歷史不變。
 	t.Run("authorized readback, pagination and bootstrap replay", func(t *testing.T) {
 		verifyMeasurementReadback(t, f, passwords)
 		persisted := f.snapshot(t)
@@ -406,6 +472,7 @@ func TestMeasurementIntegration(t *testing.T) {
 	})
 }
 
+// TestMeasurementRestart 驗證同一 PostgreSQL 叢集確實重啟後，測量和告警仍可由 API 讀回。
 func TestMeasurementRestart(t *testing.T) {
 	target := openMeasurementTestDatabase(t)
 	state := openMeasurementTestState(t, false)
@@ -417,12 +484,17 @@ func TestMeasurementRestart(t *testing.T) {
 	if err := json.Unmarshal(data, &before); err != nil {
 		t.Fatal(err)
 	}
-	if before.StartedAt.IsZero() || before.API == "" || target.clusterID != before.ClusterID ||
-		target.relations == 0 || !target.startedAt.After(before.StartedAt) {
+	// 比對叢集識別及較晚的 postmaster 啟動時間，證明測試真的跨重啟。
+	if before.StartedAt.IsZero() ||
+		before.API == "" ||
+		target.clusterID != before.ClusterID ||
+		target.relations == 0 ||
+		!target.startedAt.After(before.StartedAt) {
 		t.Fatalf("expected restart of the seeded PostgreSQL cluster, previous start %s, current %s",
 			before.StartedAt, target.startedAt)
 	}
 	t.Logf("PostgreSQL postmaster restarted: %s -> %s", before.StartedAt, target.startedAt)
+	// 重跑啟動初始化並重新登入，透過 HTTP 比較既有資料與場域權限。
 	if err := bootstrap(t.Context(), target.conn, state); err != nil {
 		t.Fatal(err)
 	}
@@ -438,6 +510,7 @@ func TestMeasurementRestart(t *testing.T) {
 	verifyMeasurementReadback(t, f, passwords)
 }
 
+// seedLegacyMeasurementFixture 只建立舊版結構及帳號，讓後續初始化可驗證升級時保留既有資料。
 func seedLegacyMeasurementFixture(t *testing.T, conn *sql.Conn, state *os.Root) map[string]string {
 	t.Helper()
 	ctx := t.Context()
@@ -448,6 +521,7 @@ func seedLegacyMeasurementFixture(t *testing.T, conn *sql.Conn, state *os.Root) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 沿用正式密碼雜湊，讓舊版帳號仍可經正式登入使用。
 	for _, account := range seedAccounts {
 		if _, err := conn.ExecContext(ctx, `
 			INSERT INTO accounts (username, role, site_id, password_hash) VALUES ($1, $2, $3, $4)
@@ -465,6 +539,7 @@ type measurementFixture struct {
 	clock  atomic.Int64
 }
 
+// now 原子讀取夾具時鐘，供請求與背景工作共用指定時間。
 func (f *measurementFixture) now() time.Time {
 	return time.Unix(0, f.clock.Load()).UTC()
 }
@@ -474,6 +549,7 @@ type measurementResult struct {
 	err     error
 }
 
+// assertMeasurementResult 同時核對採用狀態及錯誤，區分正常略過與處理失敗。
 func assertMeasurementResult(t *testing.T, got measurementResult, want bool) {
 	t.Helper()
 	if got.adopted != want || got.err != nil {
@@ -481,14 +557,17 @@ func assertMeasurementResult(t *testing.T, got measurementResult, want bool) {
 	}
 }
 
+// submit 使用應用層公開入口驗證採用結果，沿用測試的取消訊號。
 func (f *measurementFixture) submit(t *testing.T, sample Measurement, want bool) {
 	t.Helper()
 	adopted, err := f.app.SubmitMeasurement(t.Context(), sample)
 	assertMeasurementResult(t, measurementResult{adopted, err}, want)
 }
 
+// submitAsync 在背景走相同測量入口，讓測試可以觀察排隊與放鎖後的結果。
 func (f *measurementFixture) submitAsync(ctx context.Context, sample Measurement) <-chan measurementResult {
 	done := make(chan measurementResult, 1)
+	// 在背景提交並回傳結果，讓主測試可以控制鎖及時鐘。
 	go func() {
 		adopted, err := f.app.SubmitMeasurement(ctx, sample)
 		done <- measurementResult{adopted, err}
@@ -496,12 +575,14 @@ func (f *measurementFixture) submitAsync(ctx context.Context, sample Measurement
 	return done
 }
 
+// delayed 暫時擋住資料庫連線，分開控制抵達及開始採用時的時鐘。
 func (f *measurementFixture) delayed(t *testing.T, sample Measurement, received, released time.Time, want bool) {
 	t.Helper()
 	f.clock.Store(received.UnixNano())
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	entered := make(chan struct{}, 1)
+	// 時計被入口讀取時發出訊號，讓測試知道何時可推進。
 	f.app.measurementNow = func() time.Time {
 		now := f.now()
 		select {
@@ -510,6 +591,7 @@ func (f *measurementFixture) delayed(t *testing.T, sample Measurement, received,
 		}
 		return now
 	}
+	// 結束時恢復原時計，避免影響下一個案例。
 	defer func() { f.app.measurementNow = f.now }()
 
 	// 先占住應用層佇列，等入口取完抵達時間才推進時鐘。
@@ -528,6 +610,7 @@ func (f *measurementFixture) delayed(t *testing.T, sample Measurement, received,
 	assertMeasurementResult(t, <-result, want)
 }
 
+// waitForMeasurementRowLock 透過 PostgreSQL 等待事件確認目標已被鎖阻擋，再讓測試推進。
 func waitForMeasurementRowLock(t *testing.T, db *sql.DB, pid int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
@@ -554,13 +637,15 @@ func waitForMeasurementRowLock(t *testing.T, db *sql.DB, pid int) {
 }
 
 type measurementAlertWire struct {
-	ID          string
-	DeviceID    string
-	Type        string
-	Status      string
-	Temperature float64
-	DetectedAt  string
-	RecoveredAt *string
+	ID                string
+	DeviceID          string
+	Type              string
+	Status            string
+	Temperature       float64
+	DetectedAt        string
+	RecoveredAt       *string
+	DeadlineAt        string
+	DetectedAtRestart bool
 }
 
 type measurementAlertPageWire struct {
@@ -568,15 +653,18 @@ type measurementAlertPageWire struct {
 	Total, Limit, Offset int
 }
 
+// sameMeasurementAlert 比較恢復時間的內容及其餘欄位，避免指標位置影響相等判斷。
 func sameMeasurementAlert(a, b measurementAlertWire) bool {
 	if (a.RecoveredAt == nil) != (b.RecoveredAt == nil) ||
-		(a.RecoveredAt != nil && *a.RecoveredAt != *b.RecoveredAt) {
+		(a.RecoveredAt != nil &&
+			*a.RecoveredAt != *b.RecoveredAt) {
 		return false
 	}
 	a.RecoveredAt, b.RecoveredAt = nil, nil
 	return a == b
 }
 
+// alert 從正式明細端點解碼告警，保留回應的時間與欄位語意。
 func (f *measurementFixture) alert(t *testing.T, id string) measurementAlertWire {
 	t.Helper()
 	var alert measurementAlertWire
@@ -586,6 +674,7 @@ func (f *measurementFixture) alert(t *testing.T, id string) measurementAlertWire
 	return alert
 }
 
+// page 從正式清單端點取得告警分頁，讓測試能核對總數和順序。
 func (f *measurementFixture) page(t *testing.T, query string) measurementAlertPageWire {
 	t.Helper()
 	var page measurementAlertPageWire
@@ -595,17 +684,20 @@ func (f *measurementFixture) page(t *testing.T, query string) measurementAlertPa
 	return page
 }
 
+// snapshot 保存設備與告警兩種可觀察狀態，供拒絕、回滾及重啟前後比較。
 func (f *measurementFixture) snapshot(t *testing.T) string {
 	t.Helper()
 	return string(f.get(t, "/api/devices")) + "\n" + string(f.get(t, "/api/alerts"))
 }
 
+// get 以總部身分讀回資料，讓案例可專注於成功回應內容。
 func (f *measurementFixture) get(t *testing.T, path string) []byte {
 	t.Helper()
 	body, _ := f.request(t, http.MethodGet, path, "", f.hq, http.StatusOK)
 	return body
 }
 
+// login 經正式登入取得 Cookie，使授權驗證使用真實 session。
 func (f *measurementFixture) login(t *testing.T, username, password string) *http.Cookie {
 	t.Helper()
 	body, err := json.Marshal(map[string]string{"username": username, "password": password})
@@ -619,12 +711,14 @@ func (f *measurementFixture) login(t *testing.T, username, password string) *htt
 	return cookies[0]
 }
 
+// request 以正式 Host、寫入標頭及選擇的身分送 HTTP，集中核對狀態碼與禁止快取。
 func (f *measurementFixture) request(t *testing.T, method, path, body string, cookie *http.Cookie, want int) ([]byte, []*http.Cookie) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), method, f.server.URL+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 重現部署的 Host，並只對寫入附上瀏覽器需要的標頭。
 	req.Host = f.app.host
 	if cookie != nil {
 		req.AddCookie(cookie)
@@ -634,6 +728,7 @@ func (f *measurementFixture) request(t *testing.T, method, path, body string, co
 		req.Header.Set("X-CSRF-Protection", "1")
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// 送出真實 HTTP 並核對回應，登入失敗的診斷不輸出本文。
 	response, err := f.server.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -655,17 +750,26 @@ func (f *measurementFixture) request(t *testing.T, method, path, body string, co
 	return data, response.Cookies()
 }
 
+// verifyMeasurementReadback 驗證總部與場域的告警及設備讀回，並核對分頁及拒絕契約。
 func verifyMeasurementReadback(t *testing.T, f *measurementFixture, passwords map[string]string) {
 	t.Helper()
+	// 用總部完整清單作為基準，核對排序、分頁、超出範圍及明細。
 	all := f.page(t, "")
-	if all.Total != 5 || len(all.Items) != 5 || all.Limit != 50 || all.Offset != 0 {
+	if all.Total != 6 ||
+		len(all.Items) != 6 ||
+		all.Limit != 50 ||
+		all.Offset != 0 {
 		t.Fatalf("unexpected headquarters page: %+v", all)
 	}
-	if page := f.page(t, "?limit=2&offset=1"); page.Total != 5 || page.Limit != 2 || page.Offset != 1 ||
+	if page := f.page(t, "?limit=2&offset=1"); page.Total != 6 ||
+		page.Limit != 2 ||
+		page.Offset != 1 ||
 		!slices.EqualFunc(page.Items, all.Items[1:3], sameMeasurementAlert) {
 		t.Fatalf("pagination did not preserve stable ordering and scoped total: %+v", page)
 	}
-	if page := f.page(t, "?offset=99"); page.Total != 5 || page.Items == nil || len(page.Items) != 0 {
+	if page := f.page(t, "?offset=99"); page.Total != 6 ||
+		page.Items == nil ||
+		len(page.Items) != 0 {
 		t.Fatalf("unexpected empty page after offset: %+v", page)
 	}
 	for _, alert := range all.Items {
@@ -674,6 +778,7 @@ func verifyMeasurementReadback(t *testing.T, f *measurementFixture, passwords ma
 		}
 	}
 
+	// 兩個場域分別登入，核對可見結果、跨場域 404 與設備明細一致性。
 	for _, site := range []struct {
 		username string
 		visible  []measurementAlertWire
@@ -710,6 +815,7 @@ func verifyMeasurementReadback(t *testing.T, f *measurementFixture, passwords ma
 			t.Fatalf("device detail/list do not agree about latest measurement: %s / %s", detail, list)
 		}
 	}
+	// 逐一核對未登入與不允許輸入的錯誤，確認沒有公開測量上傳端點。
 	for _, request := range []struct {
 		method, path, body string
 		auth               bool

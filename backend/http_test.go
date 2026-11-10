@@ -7,6 +7,7 @@ import (
 	"testing"
 )
 
+// TestLoginRejectsInvalidRequests 經實際路由驗證登入的請求保護，錯誤輸入應在接觸資料庫前被拒絕。
 func TestLoginRejectsInvalidRequests(t *testing.T) {
 	const origin = "http://iot.localhost:8090"
 	const credentials = `{"username":"hq","password":"secret"}`
@@ -36,8 +37,10 @@ func TestLoginRejectsInvalidRequests(t *testing.T) {
 		{"query parameters", origin + "/api/login?role=headquarters", origin, "1", "application/json", credentials, "invalid_input", 400},
 	}
 	for _, test := range tests {
+		// 每個案例從真實登入路由檢查拒絕原因。
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, test.url, strings.NewReader(test.body))
+			// 將分塊案例改成未知長度，確認實際讀取也會受本文上限保護。
 			if test.name == "oversized chunked body" {
 				request.ContentLength = -1
 				request.TransferEncoding = []string{"chunked"}
@@ -45,6 +48,7 @@ func TestLoginRejectsInvalidRequests(t *testing.T) {
 			request.Header.Set("Origin", test.origin)
 			request.Header.Set("X-CSRF-Protection", test.marker)
 			request.Header.Set("Content-Type", test.mediaType)
+			// 同時核對錯誤代碼與禁止快取標頭，避免拒絕回應被共用。
 			response := httptest.NewRecorder()
 			server.ServeHTTP(response, request)
 			if response.Code != test.status || response.Body.String() != `{"error":"`+test.want+`"}` {
@@ -57,6 +61,7 @@ func TestLoginRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+// TestDeviceListQueryAllowlist 區分合法分頁的未登入回應與非法參數的輸入錯誤。
 func TestDeviceListQueryAllowlist(t *testing.T) {
 	const origin = "http://iot.localhost:8090"
 	server := (&application{host: "iot.localhost:8090", origin: origin}).router()
@@ -78,6 +83,7 @@ func TestDeviceListQueryAllowlist(t *testing.T) {
 		{"?role=headquarters", 400},
 		{"?limit=%zz", 400},
 	} {
+		// 逐一送出合法邊界、重複參數及非允許欄位，確認驗證發生在登入前。
 		t.Run(test.query, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, origin+"/api/devices"+test.query, nil)
 			response := httptest.NewRecorder()

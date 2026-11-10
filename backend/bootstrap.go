@@ -101,6 +101,14 @@ const createSimulationSchema = `
 	);
 `
 
+const addOfflineAlertColumns = `
+	ALTER TABLE alerts
+		ALTER COLUMN temperature DROP NOT NULL,
+		ADD COLUMN IF NOT EXISTS deadline_at_ns bigint,
+		ADD COLUMN IF NOT EXISTS detected_at_restart boolean NOT NULL DEFAULT false;
+`
+
+// bootstrap 在單一資料庫交易中準備結構及展示資料，並核對重啟前留下的本機憑證。
 func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -108,7 +116,8 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, createSchema+createMeasurementSchema+createSimulationSchema); err != nil {
+	// 套用現有與新增的資料表後，依資料庫是否已有帳號選擇載入或初始化憑證。
+	if _, err := tx.ExecContext(ctx, createSchema+createMeasurementSchema+createSimulationSchema+addOfflineAlertColumns); err != nil {
 		return operationFailure("create IoT schema", err)
 	}
 	var count int
@@ -120,6 +129,7 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 		return operationFailure("read or initialize protected demo credentials", err)
 	}
 
+	// 首次啟動才預載場域、設備及帳號，資料庫只保存密碼雜湊。
 	if count == 0 {
 		if _, err := tx.ExecContext(ctx, createSeedDevices); err != nil {
 			return operationFailure("insert seed sites and devices", err)
@@ -133,6 +143,7 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 			}
 		}
 	} else {
+		// 重啟時核對既有帳號的角色、場域及密碼，避免憑證檔與資料庫不一致仍啟動。
 		if count != len(seedAccounts) {
 			return errors.New("unexpected demo account count")
 		}
@@ -157,7 +168,9 @@ func bootstrap(ctx context.Context, conn *sql.Conn, state *os.Root) error {
 	return operationFailure("commit seed transaction", tx.Commit())
 }
 
+// readPrivateFile 在受限的根目錄內讀取小型私密設定，只接受權限為 0600 的一般檔案。
 func readPrivateFile(state *os.Root, name string) ([]byte, error) {
+	// 先檢查路徑本身的檔案類型與權限，避免接受符號連結。
 	info, err := state.Lstat(name)
 	if err != nil {
 		return nil, err
@@ -170,6 +183,7 @@ func readPrivateFile(state *os.Root, name string) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
+	// 再核對實際開啟的檔案，檢查兩次操作之間是否被替換。
 	current, err := file.Stat()
 	if err != nil {
 		return nil, err
@@ -177,6 +191,7 @@ func readPrivateFile(state *os.Root, name string) ([]byte, error) {
 	if current.Mode() != 0o600 || !os.SameFile(info, current) {
 		return nil, errors.New("protected file changed before opening")
 	}
+	// 多讀一個位元組以區分恰好到上限與超過上限。
 	const maxSize = 4096
 	data, err := io.ReadAll(io.LimitReader(file, maxSize+1))
 	if err == nil && len(data) > maxSize {
@@ -185,9 +200,11 @@ func readPrivateFile(state *os.Root, name string) ([]byte, error) {
 	return data, err
 }
 
+// demoPasswords 載入受保護的展示密碼。只有初始化且檔案缺失才產生新密碼，讓中斷後可重用原憑證。
 func demoPasswords(state *os.Root, initialize bool) (map[string]string, error) {
 	data, err := readPrivateFile(state, demoPasswordsName)
 	var passwords map[string]string
+	// 首次初始化為每個帳號產生獨立的隨機密碼。
 	if errors.Is(err, os.ErrNotExist) && initialize {
 		passwords = make(map[string]string, len(seedAccounts))
 		for _, account := range seedAccounts {
@@ -200,6 +217,7 @@ func demoPasswords(state *os.Root, initialize bool) (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		// 核對保存的密碼涵蓋預載帳號且各不相同，避免以不完整設定繼續。
 		if err := json.Unmarshal(data, &passwords); err != nil {
 			return nil, err
 		}
@@ -230,15 +248,19 @@ func demoPasswords(state *os.Root, initialize bool) (map[string]string, error) {
 	return passwords, nil
 }
 
+// writeDemoPasswords 先寫妥暫存檔再以同目錄的硬連結發布，避免讀到半成品或覆蓋既有憑證。
 func writeDemoPasswords(state *os.Root, passwords map[string]string) (err error) {
+	// 以獨占方式建立 0600 暫存檔，避免碰撞時改寫其他檔案。
 	name := ".demo-passwords-" + randomSecret()
 	file, err := state.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
+	// 成功或失敗都清除暫存名稱，並保留清理錯誤。
 	defer func() {
 		err = errors.Join(err, state.Remove(name))
 	}()
+	// 先寫入並同步完整內容，再發布正式檔名。
 	encodeErr := json.NewEncoder(file).Encode(passwords)
 	if encodeErr != nil {
 		return errors.Join(encodeErr, file.Close())
@@ -257,9 +279,13 @@ type startupError struct {
 	cause     error
 }
 
+// Error 只公開啟動操作名稱，避免把底層的連線資訊或憑證寫入日誌。
 func (e startupError) Error() string { return fmt.Sprintf("IoT startup: %s", e.operation) }
+
+// Unwrap 保留底層錯誤供呼叫端用 errors.Is 或 errors.As 判斷。
 func (e startupError) Unwrap() error { return e.cause }
 
+// operationFailure 只包裝失敗操作，讓呼叫端能直接傳回提交等操作的結果。
 func operationFailure(operation string, cause error) error {
 	if cause == nil {
 		return nil
