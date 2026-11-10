@@ -102,9 +102,9 @@ async function browserFlow(origin, passwords, tokens) {
     // 等最後一項出現後比對整份清單，避免只驗證有一筆資料或忽略多餘項目。
     async function checkList(ids) {
       await page.getByRole('button', { name: new RegExp(deviceName(ids.at(-1))) }).waitFor()
-      // 將畫面空白正規化後，對照每個預期識別對應的顯示名稱與場域。
+      // 新設備的即時狀態也須在清單上以文字顯示。
       const actual = (await listItems.allInnerTexts()).map(text => text.replace(/\s+/g, ' ').trim())
-      const expected = ids.map(id => `${deviceName(id)} ${id.startsWith('north') ? '北區場域' : '南區場域'}`)
+      const expected = ids.map(id => `${deviceName(id)} ${id.startsWith('north') ? '北區場域' : '南區場域'} 尚未回報`)
       check(actual, expected, '瀏覽器設備清單與登入範圍不符')
     }
 

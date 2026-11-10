@@ -163,9 +163,10 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
   const browser = await chromium.launch({ executablePath, timeout: 15_000 })
   const consoleErrors = []
   let favicon404 = 0
+  let restarting = false
 
   try {
-    // 將既有登入放進獨立的瀏覽器環境，讓此案例專注於設備狀態與手動刷新。
+    // 沿用既有總部登入驗證設備詳情的即時更新、手動刷新與重連。
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
     await context.addCookies([{
       name: 'iot_session', value: hqCookie.slice('iot_session='.length), url: stack.origin,
@@ -173,7 +174,7 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     }])
     const page = await context.newPage()
     page.setDefaultTimeout(8_000)
-    // 只略過一次預期的 favicon 404，其餘 console 錯誤經遮蔽後保留。
+    // 只略過 favicon 404 及刻意停機期間的預期連線錯誤。
     page.on('console', message => {
       if (message.type() !== 'error') return
       if (
@@ -183,6 +184,13 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
       ) {
         favicon404 += 1
       } else {
+        const { url } = message.location()
+        if (
+          restarting
+          && ['/api/events', '/api/session', devicePath('north-01'), simulationPath('north-01')]
+            .some(path => url === stack.origin + path)
+          && /net::ERR_(CONNECTION_REFUSED|CONNECTION_RESET|EMPTY_RESPONSE)$/.test(message.text())
+        ) return
         consoleErrors.push(safeDiagnostic(`${message.text()} @ ${message.location().url}`, diagnosticSecrets))
       }
     })
@@ -194,6 +202,9 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     await page.getByRole('button', { name: /北區設備 01/ }).click()
     await page.getByText('north-01', { exact: true }).waitFor()
     await page.getByText('尚未回報', { exact: true }).waitFor()
+    const liveStatus = page.locator('#live-status')
+    const live = liveStatus.filter({ hasText: '即時更新中' })
+    await live.waitFor()
 
     // 檢查實際視窗尺寸、橫向溢位及手動刷新按鈕，避免只比較設定值。
     async function checkViewport(width, height) {
@@ -227,7 +238,10 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     assert.equal(temperatureBefore.status, 'active', '超標後溫度告警須持續中')
     assert.equal(temperatureBefore.temperature, 30, '溫度告警須保留原始異常值')
 
-    // 在點擊前監聽指定設備的 GET，將實際刷新回應與畫面時間比對。
+    // 不操作畫面也須顯示已提交的測量，再由手動刷新核對回應與時間。
+    await page.getByText('在線', { exact: true }).waitFor()
+    await page.getByText('30°C', { exact: true }).waitFor()
+    await live.waitFor()
     const refreshButton = page.getByRole('button', { name: '重新載入設備狀態', exact: true })
     const firstRefresh = page.waitForResponse(response =>
       response.url() === stack.origin + devicePath('north-01') && response.request().method() === 'GET')
@@ -260,24 +274,10 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     const temperatureDuringOffline = oneAlert(await alerts(stack, hqCookie), 'north-01', 'temperature')
     assert.deepEqual(temperatureDuringOffline, temperatureBefore, '離線不能覆蓋或恢復獨立的溫度告警')
 
-    // 手動刷新前保留舊快照，避免頁面自行推算離線或改寫回報時間。
-    await page.getByText('在線', { exact: true }).waitFor()
-    assert.equal(await page.getByText('資料已非即時', { exact: true }).count(), 0,
-      '手動更新前瀏覽器仍顯示先前快照')
-    assert.equal(await page.locator('time[datetime]').getAttribute('datetime'), firstDisplayedReceipt,
-      '手動更新前瀏覽器不可自行改寫回報時間')
-    // 監聽指定設備的刷新請求，確認讀回離線時仍顯示原溫度與回報時間。
-    const offlineRefresh = page.waitForResponse(response =>
-      response.url() === stack.origin + devicePath('north-01') && response.request().method() === 'GET')
-    await refreshButton.click()
-    const offlineRefreshResponse = await offlineRefresh
-    assert.equal(offlineRefreshResponse.status(), 200, '離線後手動刷新須讀取設備 API')
-    const offlineDisplayedDevice = await offlineRefreshResponse.json()
+    // 背景檢查提交離線後，瀏覽器自動顯示離線並保留原溫度與回報時間。
     await page.getByText('離線', { exact: true }).waitFor()
     await page.getByText('資料已非即時', { exact: true }).waitFor()
     await page.getByText('30°C', { exact: true }).waitFor()
-    assert.equal(offlineDisplayedDevice.latestMeasurement?.receivedAt, lastReceipt,
-      '離線 API 須保留最後一筆回報時間')
     assert.equal(await page.locator('time[datetime]').getAttribute('datetime'), lastReceipt,
       '離線畫面仍顯示最後有效回報時間')
 
@@ -302,12 +302,16 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     const firstExpectedBeforeRestart = readFirstExpected()
     assert.match(firstExpectedBeforeRestart, /^[1-9]\d*$/, '首筆期待起點須已持久保存為整數奈秒')
 
+    restarting = true
     stack.stop()
+    await liveStatus.filter({ hasText: '即時連線中斷' }).waitFor()
     // 停止容器後實際經過離線期限，再由正式啟動掃描補判。
     await new Promise(resolve => setTimeout(resolve, 15_250))
     stack.start()
     assert.deepEqual(await json(await api(stack, hqCookie, '/api/session'), 200, '服務重啟後 HQ session'), login,
       '服務重啟後原總部 session 仍有效')
+    await live.waitFor()
+    restarting = false
 
     // 重啟後從正式 API 一次讀取三台設備與告警，比對各自的起點及模擬終態。
     const [northOneAfterRestart, northTwoAfterRestart, northThreeAfterRestart,
@@ -369,28 +373,13 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     assert.deepEqual(oneAlert(recoveredAlerts, 'north-01', 'temperature'), temperatureBefore,
       '異常回報恢復在線時，溫度告警仍持續中')
 
-    // 恢復後仍須等手動讀取才更新瀏覽器快照，並以新 API 回報時間核對畫面。
-    await page.getByText('離線', { exact: true }).waitFor()
-    await page.getByText('資料已非即時', { exact: true }).waitFor()
-    assert.equal(await page.locator('time[datetime]').getAttribute('datetime'),
-      liveOffline.item.latestMeasurement.receivedAt,
-      '恢復資料尚未手動重新載入時仍保留舊畫面')
-    // 監聽本次設備 GET，區分新快照與瀏覽器保留的舊回報時間。
-    const recoveryRefresh = page.waitForResponse(response =>
-      response.url() === stack.origin + devicePath('north-01') && response.request().method() === 'GET')
-    await refreshButton.click()
-    const recoveryRefreshResponse = await recoveryRefresh
-    assert.equal(recoveryRefreshResponse.status(), 200, '恢復後手動刷新須讀取設備 API')
-    const recoveredDisplayedDevice = await recoveryRefreshResponse.json()
+    // 重連後的同一頁隨已提交回報恢復，並顯示這次恢復的有效回報時間。
     await page.getByText('在線', { exact: true }).waitFor()
     await page.getByText('30°C', { exact: true }).waitFor()
     assert.equal(await page.getByText('資料已非即時', { exact: true }).count(), 0,
-      '恢復在線並刷新後須清除非即時提示')
-    assert.equal(await page.locator('time[datetime]').getAttribute('datetime'), recoveredDisplayedDevice.latestMeasurement.receivedAt,
-      '刷新後回報時間須與這次刷新的 API 資料相同')
-    assert.notEqual(await page.locator('time[datetime]').getAttribute('datetime'),
-      liveOffline.item.latestMeasurement.receivedAt,
-      '刷新後畫面須顯示更新的回報時間')
+      '恢復在線後須自動清除非即時提示')
+    assert.equal(await page.locator('time[datetime]').getAttribute('datetime'), recoveredDevice.latestMeasurement.receivedAt,
+      '恢復後畫面須顯示已提交的新回報時間')
 
     // 驗收結尾檢查實際頁面與遮蔽後的錯誤清單，讓建置或腳本問題也能使測試失敗。
     assert.equal(await page.locator('vite-error-overlay, #webpack-dev-server-client-overlay').count(), 0,

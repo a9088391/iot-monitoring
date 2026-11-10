@@ -127,8 +127,8 @@ func stopSimulationsOnStartup(ctx context.Context, conn *sql.Conn) error {
 	return operationFailure("commit startup simulation stop", tx.Commit())
 }
 
-const simulationStateSQL = `
-	SELECT COALESCE(s.mode, 'stopped'), COALESCE(s.version, 0)
+const simulationStateFieldsSQL = `
+	COALESCE(s.mode, 'stopped'), COALESCE(s.version, 0)
 	FROM devices d LEFT JOIN device_simulations s ON s.device_id = d.id
 	WHERE d.id = $1
 `
@@ -163,7 +163,7 @@ func (a *application) readSimulation(ctx context.Context, id string, hash []byte
 		}
 		// 讀取持久的模式和版本，再從程序內的原始樣本判斷重送是否可用。
 		var version int64
-		if err := conn.QueryRowContext(ctx, simulationStateSQL, id).Scan(&state.Mode, &version); err != nil {
+		if err := conn.QueryRowContext(ctx, "SELECT"+simulationStateFieldsSQL, id).Scan(&state.Mode, &version); err != nil {
 			return err
 		}
 		s.mu.Lock()
@@ -198,9 +198,9 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 		if !validDeviceID(id) {
 			return sql.ErrNoRows
 		}
-		var mode string
+		var site, mode string
 		var version int64
-		if err := tx.QueryRowContext(ctx, simulationStateSQL, id).Scan(&mode, &version); err != nil {
+		if err := tx.QueryRowContext(ctx, "SELECT d.site_id,"+simulationStateFieldsSQL, id).Scan(&site, &mode, &version); err != nil {
 			return err
 		}
 		if version != expected {
@@ -309,6 +309,7 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 			outgoing = device.latest
 		}
 		state = simulationState{Mode: mode, Version: strconv.FormatInt(next, 10), CanReplay: device.latest != nil}
+		a.events.publish(site)
 		return nil
 	})
 	// 離開持鎖連線後才送第一筆或重送，讓測量入口能自行取得連線。

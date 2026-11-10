@@ -19,7 +19,7 @@ type AlertPage = { items: Alert[]; total: number; limit: number; offset: number 
 const props = defineProps<{
   api: {
     readApi: <T>(path: string, generation: number, controller: AbortController) => Promise<T>
-    writeApi: <T>(path: string, init: RequestInit) => Promise<T>
+    writeApi: <T>(path: string, init: RequestInit, generation: number) => Promise<T>
     apiMessage: (error: unknown, fallback: string, notFound: string) => string
     expireSession: (generation: number) => void
     isCurrentIdentity: (generation: number) => boolean
@@ -60,6 +60,13 @@ let mounted = true
 
 // 以 Unicode 碼位計數，讓非 BMP 字元也只算一個。
 const resultLength = computed(() => [...draft.value].length)
+// 查詢範圍包含目前頁碼或告警編號，讓上層取消上一個範圍的被動讀取。
+const liveTarget = computed(() => selectedId.value ? `alert:${selectedId.value}` : `page:${offset.value}`)
+const liveReady = computed(() =>
+  !pageLoading.value
+  && !detailLoading.value
+  && !closurePending.value
+  && !needsVerification.value)
 
 // 在同一畫面內切換查詢時取消前一個讀取，並用控制器辨識回應歸屬。
 function startRead(): AbortController {
@@ -88,28 +95,33 @@ async function focusHeading(controller?: AbortController): Promise<void> {
 }
 
 // 讀取伺服器已限制場域的告警頁，失敗時以相同偏移量提供重試。
-async function loadPage(nextOffset: number): Promise<void> {
+async function loadPage(nextOffset: number, passive?: AbortController): Promise<boolean> {
   if (
     pageLoading.value
     || selectedId.value
     || !api.isCurrentIdentity(generation)
-  ) return
-  const controller = startRead()
+  ) return false
+  const controller = passive ?? startRead()
   const changingPage = nextOffset !== offset.value
-  offset.value = nextOffset
-  page.value = null
-  pageError.value = ''
-  pageLoading.value = true
+  if (!passive) {
+    offset.value = nextOffset
+    page.value = null
+    pageError.value = ''
+    pageLoading.value = true
+  }
   try {
     const loaded = await api.readApi<AlertPage>(`/api/alerts?limit=${pageSize}&offset=${nextOffset}`, generation, controller)
-    if (!ownsRead(controller)) return
+    if (passive ? !ownsLiveRead(passive) : !ownsRead(controller)) return false
     page.value = loaded
     offset.value = loaded.offset
+    pageError.value = ''
+    return true
   } catch (error) {
     if (error instanceof api.ApiError && error.status === 401) api.expireSession(generation)
-    else if (ownsRead(controller)) pageError.value = api.apiMessage(error, '告警歷程載入失敗，請重試。', notFound)
+    else if (!passive && ownsRead(controller)) pageError.value = api.apiMessage(error, '告警歷程載入失敗，請重試。', notFound)
+    return false
   } finally {
-    if (ownsRead(controller)) {
+    if (!passive && ownsRead(controller)) {
       pageLoading.value = false
       // 換頁會移除原本的分頁按鈕，讀取結束後把鍵盤焦點移回歷程標題。
       if (changingPage) void focusHeading(controller)
@@ -140,25 +152,30 @@ function hideAlert(error: unknown): void {
 }
 
 // 查詢單筆告警；寫入結果不明時，只有讀回目前狀態才能解除重送限制。
-async function loadAlert(): Promise<void> {
+async function loadAlert(passive?: AbortController): Promise<boolean> {
   const id = selectedId.value
   if (
     !id
     || detailLoading.value
     || !api.isCurrentIdentity(generation)
-  ) return
+  ) return false
 
-  const controller = startRead()
+  const controller = passive ?? startRead()
   const verifying = needsVerification.value
   const manualVerification = verifying && !closurePending.value
   if (manualVerification) setClosurePending(true)
-  detailLoading.value = true
-  detailError.value = ''
+  if (!passive) {
+    detailLoading.value = true
+    detailError.value = ''
+  }
   try {
     const loaded = await api.readApi<Alert>(alertPath(id), generation, controller)
-    if (!ownsRead(controller) || !ownsAlert(id)) return
+    if (passive ? !ownsLiveRead(passive) : !ownsRead(controller)) return false
+    if (!ownsAlert(id)) return false
     if (loaded?.id !== id) throw new Error('Unexpected alert response')
     selectedAlert.value = loaded
+    detailError.value = ''
+    detailUnavailable.value = false
     if (verifying) {
       // 讀回只證明目前的狀態，無法據此判定是誰的請求成功。
       needsVerification.value = false
@@ -167,12 +184,14 @@ async function loadAlert(): Promise<void> {
         : '已讀取告警目前的狀態。'
       if (loaded.status !== 'recovered') void focusHeading()
     }
+    return true
   } catch (error) {
     if (error instanceof api.ApiError && error.status === 401) {
       api.expireSession(generation)
-      return
+      return false
     }
-    if (!ownsRead(controller) || !ownsAlert(id)) return
+    if (passive ? !ownsLiveRead(passive) : !ownsRead(controller)) return false
+    if (!ownsAlert(id)) return false
     if (
       error instanceof api.ApiError
       && (
@@ -181,18 +200,39 @@ async function loadAlert(): Promise<void> {
       )
     ) {
       hideAlert(error)
-    } else {
+    } else if (!passive) {
       detailError.value = verifying
         ? '仍無法確認告警狀態。請重新讀取告警，確認後才能再次結案。'
         : api.apiMessage(error, '告警詳情載入失敗，請重試。', notFound)
     }
+    return false
   } finally {
-    if (ownsRead(controller) && ownsAlert(id)) {
+    if (
+      !passive
+      && ownsRead(controller)
+      && ownsAlert(id)
+    ) {
       detailLoading.value = false
       if (manualVerification) setClosurePending(false)
     }
   }
 }
+
+// 被動讀取離開原範圍或碰到手動操作後，即使回應已在傳輸中也不得套用。
+function ownsLiveRead(controller: AbortController): boolean {
+  return mounted
+    && !controller.signal.aborted
+    && api.isCurrentIdentity(generation)
+}
+
+// 沿用授權讀取，但不清除分頁 DOM、草稿或手動結案確認狀態。
+async function refreshLive(controller: AbortController): Promise<boolean> {
+  if (!liveReady.value || !ownsLiveRead(controller)) return false
+  if (selectedId.value) return loadAlert(controller)
+  return loadPage(offset.value, controller)
+}
+
+defineExpose({ liveReady, liveTarget, needsVerification, refreshLive })
 
 // 開啟告警後以單筆 API 重新確認權限與狀態，避免使用過時的清單資料結案。
 function openAlert(id: string): void {
@@ -248,7 +288,7 @@ async function closeAlert(): Promise<void> {
       headers: { 'Content-Type': 'application/json', ...api.csrfHeaders },
       body: JSON.stringify({ result }),
       signal: controller.signal,
-    })
+    }, generation)
     if (!ownsAlert(id)) return
     // 只有原請求收到已提交的結案紀錄，才顯示送出成功。
     if (
@@ -349,7 +389,7 @@ onBeforeUnmount(() => {
         type="button"
         class="button button-secondary"
         :disabled="closurePending || detailLoading"
-        @click="loadAlert"
+        @click="loadAlert()"
       >重新讀取告警</button>
 
       <dl v-if="selectedAlert" class="device-details">

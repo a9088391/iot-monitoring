@@ -233,7 +233,16 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     await hqPage.getByText('23°C', { exact: true }).waitFor()
     await hqPage.getByText('已開始正常回報。', { exact: true }).waitFor()
 
-    // 由另一個請求先寫入新版本，刻意保留瀏覽器畫面的舊版本。
+    // 在舊快照已讀取後保留它，直到瀏覽器送出控制，避免即時讀回提前消除版本衝突。
+    const priorSnapshot = await responseJson(await sendAsHq(simulationPath), 200, '原模擬快照')
+    assert.deepEqual(priorSnapshot, normalState)
+    let conflictSent = false
+    await hqPage.route(stack.origin + simulationPath, async route => {
+      if (route.request().method() === 'POST') conflictSent = true
+      if (conflictSent) await route.continue()
+      else await route.fulfill({ json: priorSnapshot })
+    })
+    // 另一個真實請求先寫入新版本，讓舊快照在服務端確實失效。
     const externalResponse = await sendAsHq(simulationPath, 'POST', { action: 'abnormal', version: normalState.version })
     const externalState = await responseJson(externalResponse, 200, '第二個總部控制')
     assert.equal(externalState.mode, 'abnormal', '第二個總部控制須切換至異常模式')
@@ -246,6 +255,7 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
       hqPage.waitForResponse(item => item.url() === stack.origin + simulationPath && item.request().method() === 'POST'),
       normalButton.click(),
     ])
+    await hqPage.unroute(stack.origin + simulationPath)
     assert.equal(conflictResponse.status(), 409, '瀏覽器送出舊版本時須收到衝突')
     await hqPage
       .getByRole('alert')
@@ -399,6 +409,15 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
       await sendAsHq('/api/devices/north-01'), 200, '重啟前設備讀回',
     )
     assert.equal(beforeRestartDevice.latestMeasurement?.temperature, 23, '重啟前正常回報須已採用')
+    // 瀏覽器驗證已結束，先關閉頁面及串流，後續由正式 API 驗證重啟。
+    assert.equal(expectedResources.find(resource => resource.url === stack.origin + '/api/session')?.count, 2,
+      '只允許兩筆未登入時的 session 探查回應')
+    for (const page of [hqPage, sitePage]) {
+      assert.equal(await page.locator('vite-error-overlay, #webpack-dev-server-client-overlay').count(), 0,
+        '畫面不可出現前端建置錯誤覆蓋層')
+      await page.close()
+    }
+    assert.deepEqual(browserErrors, [], `瀏覽器不可有 JavaScript 或 console error：${browserErrors.join(' | ')}`)
     // 以原 session 讀回重啟後的狀態，區分保留的測量與失效的模擬執行。
     stack.stop()
     stack.start()
@@ -422,14 +441,6 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     assert.deepEqual(laterDevice.latestMeasurement, afterRestartDevice.latestMeasurement,
       '重啟後跨過回報週期不得出現新測量')
 
-    // 核對預期未登入探查數量，並檢查兩個頁面的建置覆蓋層及收集到的錯誤。
-    assert.equal(expectedResources.find(resource => resource.url === stack.origin + '/api/session')?.count, 2,
-      '只允許兩筆未登入時的 session 探查回應')
-    for (const page of [hqPage, sitePage]) {
-      assert.equal(await page.locator('vite-error-overlay, #webpack-dev-server-client-overlay').count(), 0,
-        '畫面不可出現前端建置錯誤覆蓋層')
-    }
-    assert.deepEqual(browserErrors, [], `瀏覽器不可有 JavaScript 或 console error：${browserErrors.join(' | ')}`)
   } finally {
     // 即使中途失敗也先釋放 Chrome，讓外層回收測試專案。
     await browser.close()

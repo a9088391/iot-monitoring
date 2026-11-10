@@ -136,6 +136,7 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
 
     const browserErrors = []
     const closeRequests = []
+    let restarting = false
     // 僅放行已知階段、精確路徑及有限次數的資源錯誤。
     const expectedErrors = [
       ['/api/session', 'status of 401', 1],
@@ -158,6 +159,12 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
       if (message.type() !== 'error') return
       const { url } = message.location()
       const description = message.text()
+      // 刻意停機時，串流及其身分查驗可能先收到連線錯誤。
+      if (
+        restarting
+        && (url === stack.origin + '/api/events' || url === stack.origin + '/api/session')
+        && /net::ERR_(CONNECTION_REFUSED|CONNECTION_RESET|EMPTY_RESPONSE)$/.test(description)
+      ) return
       const expected = expectedErrors.find(([path, reason, remaining]) =>
         remaining > 0
         && url === stack.origin + path
@@ -344,6 +351,7 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     await input.fill(unknownDraft)
     let committed
     let droppedReadback
+    let droppingReadback = false
     const releaseReadback = Promise.withResolvers()
     // 以瀏覽器原始本文與憑證轉送一次真實 POST，保留已提交回應供斷言。
     await page.route(stack.origin + closePath(northUnknown), async route => {
@@ -367,11 +375,17 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     }, { times: 1 })
     // 首次讀回也查詢真實服務，在頁面處於等待時驗證離開保護。
     await page.route(stack.origin + detailPath(northUnknown), async route => {
+      // 提交之前的 SSE 背景讀取照常送出，不能消耗本次故障注入。
+      if (!committed || droppingReadback) {
+        await route.continue()
+        return
+      }
+      droppingReadback = true
       assert.equal(route.request().method(), 'GET')
       droppedReadback = await json(await send(detailPath(northUnknown), northCookie), 200, '遺失的首次讀回')
       await releaseReadback.promise
       await route.abort('connectionreset')
-    }, { times: 1 })
+    })
     try {
       await submit.click()
       await page.getByText('正在讀取告警…', { exact: true }).waitFor()
@@ -398,14 +412,20 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
 
     await readAgain.click()
     await page.getByText('已讀取告警目前的狀態。', { exact: true }).waitFor()
+    await page.unroute(stack.origin + detailPath(northUnknown))
     await expectReadOnly(committed.closure)
     assert.equal(await page.getByText(success, { exact: true }).count(), 0)
     assert.equal(closeRequests.filter(path => path === closePath(northUnknown)).length, 1)
 
     // 用原登入重新載入重啟後的服務，並從歷程選取原本結案。
+    const live = page.locator('#live-status').filter({ hasText: /^即時更新中$/ })
+    await live.waitFor()
+    restarting = true
     stack.stop()
     stack.start()
     await page.reload()
+    await live.waitFor()
+    restarting = false
     await historyButton.click()
     await row(northRecovered).click()
     await expectReadOnly(saved.closure)

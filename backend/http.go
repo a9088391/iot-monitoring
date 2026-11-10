@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -21,9 +23,11 @@ import (
 )
 
 const (
-	bodyLimit       = 16 * 1024
-	sessionCookie   = "iot_session"
-	sessionLifetime = 8 * time.Hour
+	bodyLimit           = 16 * 1024
+	sessionCookie       = "iot_session"
+	sessionLifetime     = 8 * time.Hour
+	sessionViewHeader   = "X-IOT-Session-View"
+	sessionExpiryHeader = "X-IOT-Session-Expires-At"
 )
 
 type application struct {
@@ -33,6 +37,7 @@ type application struct {
 	measurementNow func() time.Time
 	arrivals       pendingMeasurements
 	simulator      *simulator
+	events         liveEvents
 }
 
 // router 組裝本機網站與 API，讓共同的 Host 檢查及 API 寫入保護先於各端點執行。
@@ -72,6 +77,7 @@ func (a *application) router() http.Handler {
 	api.POST("/login", a.login)
 	api.POST("/logout", a.logout)
 	api.GET("/session", a.session)
+	api.GET("/events", a.eventVersions)
 	api.GET("/devices", a.devices)
 	api.GET("/devices/:id", a.device)
 	api.GET("/devices/:id/simulation", a.simulationControl)
@@ -108,6 +114,15 @@ func (a *application) protectAPI(c *gin.Context) {
 		return
 	}
 	r.Body = http.MaxBytesReader(c.Writer, r.Body, bodyLimit)
+	// 前端可要求操作綁定它驗證過的 Cookie，避免其他分頁換發後改用不同登入。
+	if views := r.Header.Values(sessionViewHeader); len(views) != 0 {
+		hash := sessionHash(r)
+		if len(views) != 1 ||
+			hash == nil ||
+			views[0] != sessionViewer(hash) {
+			reject(c, http.StatusUnauthorized, "unauthenticated")
+		}
+	}
 }
 
 // singleHeader 要求安全標頭只有一個且值完全相符，避免接受重複或含糊的輸入。
@@ -284,13 +299,27 @@ func (a *application) login(c *gin.Context) {
 		return
 	}
 	// 換發成功後才通知瀏覽器，以免 Cookie 指向未建立的 session。
-	token, err := a.rotateSession(r.Context(), user.Username, sessionHash(r))
+	token, expiresAt, err := a.rotateSession(r.Context(), user.Username, sessionHash(r))
 	if err != nil {
 		unavailable(c)
 		return
 	}
 	setCookie(c, token, int(sessionLifetime/time.Second))
+	digest := sha256.Sum256([]byte(token))
+	setSessionHeaders(c, digest[:], expiresAt)
 	c.JSON(http.StatusOK, user)
+}
+
+// sessionViewer 以獨立用途的雜湊衍生識別值，瀏覽器只用它比對 Cookie 所代表的登入。
+func sessionViewer(hash []byte) string {
+	digest := sha256.Sum256(append([]byte("iot/session-view/v1\x00"), hash...))
+	return base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
+// setSessionHeaders 以獨立標頭附上登入識別值及資料庫的絕對期限，保留原本身分 JSON。
+func setSessionHeaders(c *gin.Context, hash []byte, expiresAt time.Time) {
+	c.Header(sessionViewHeader, sessionViewer(hash))
+	c.Header(sessionExpiryHeader, expiresAt.UTC().Format(time.RFC3339Nano))
 }
 
 // setCookie 以限定主機、禁止前端腳本讀取且 SameSite 嚴格的 Cookie 傳送或移除 session token。
@@ -322,27 +351,34 @@ func (a *application) session(c *gin.Context) {
 	if !noQuery(c) || !emptyBody(c) {
 		return
 	}
-	if user, ok := a.authenticated(c); ok {
+	hash := sessionHash(c.Request)
+	if user, expiresAt, ok := a.authenticatedSession(c, hash); ok {
+		setSessionHeaders(c, hash, expiresAt)
 		c.JSON(http.StatusOK, user)
 	}
 }
 
-// authenticated 只從有效 session 取得身分，並區分登入失效與資料庫故障。
+// authenticated 由有效 session 取得設備及告警查詢所需的身分。
 func (a *application) authenticated(c *gin.Context) (identity, bool) {
-	hash := sessionHash(c.Request)
+	user, _, ok := a.authenticatedSession(c, sessionHash(c.Request))
+	return user, ok
+}
+
+// authenticatedSession 以同一次查詢確認身分及期限，並區分登入失效與資料庫故障。
+func (a *application) authenticatedSession(c *gin.Context, hash []byte) (identity, time.Time, bool) {
 	// 由 token 雜湊查回身分。找不到或已到期走共同未登入回應，其他錯誤走服務不可用。
 	if hash != nil {
-		user, err := a.sessionIdentity(c.Request.Context(), hash)
+		user, expiresAt, err := a.sessionIdentity(c.Request.Context(), hash)
 		if err == nil {
-			return user, true
+			return user, expiresAt, true
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			unavailable(c)
-			return identity{}, false
+			return identity{}, time.Time{}, false
 		}
 	}
 	reject(c, http.StatusUnauthorized, "unauthenticated")
-	return identity{}, false
+	return identity{}, time.Time{}, false
 }
 
 // parsePage 提供清單共用的分頁預設值，拒絕重複、超出範圍或未定義的參數。

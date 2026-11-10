@@ -90,11 +90,11 @@ func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement)
 		defer tx.Rollback()
 
 		// 依序鎖定該設備的執行、最新測量及未恢復告警，等待結束後才判斷採用期限。
-		var allowed int
+		var site string
 		err = tx.QueryRowContext(ctx, `
-			SELECT 1 FROM measurement_runs
-			WHERE device_id = $1 AND data_generation = $2 AND run_id = $3 FOR UPDATE
-		`, sample.DeviceID, sample.DataGeneration, sample.RunID).Scan(&allowed)
+			SELECT d.site_id FROM measurement_runs r JOIN devices d ON d.id = r.device_id
+			WHERE r.device_id = $1 AND r.data_generation = $2 AND r.run_id = $3 FOR UPDATE OF r
+		`, sample.DeviceID, sample.DataGeneration, sample.RunID).Scan(&site)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -170,6 +170,7 @@ func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement)
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit measurement transaction: %w", err)
 		}
+		a.events.publish(site)
 		adopted = true
 		return nil
 	})

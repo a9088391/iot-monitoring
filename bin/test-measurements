@@ -9,7 +9,8 @@ case "$#:${1:-}" in
     1:simulation) suite=Simulation ;;
     1:offline) suite=Offline ;;
     1:closure) suite=Closure ;;
-    *) printf '%s\n' '用法：bin/test-measurements [simulation|offline|closure]' >&2; exit 2 ;;
+    1:sse) suite=SSE ;;
+    *) printf '%s\n' '用法：bin/test-measurements [simulation|offline|closure|sse]' >&2; exit 2 ;;
 esac
 integration_test=Test${suite}Integration
 restart_test=Test${suite}Restart

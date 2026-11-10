@@ -124,8 +124,14 @@ func (a *application) scanOfflineLocked(ctx context.Context, conn *sql.Conn, atR
 		return nil, errors.New("offline scan clock outside supported range")
 	}
 
+	// 先收集實際新增告警的場域，確認交易提交後才能通知訂閱端。
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin offline scan: %w", err)
+	}
+	defer tx.Rollback()
 	// 期限內已抵達的回報先處理；期限後才抵達的回報不會遮蔽逾時。
-	rows, err := conn.QueryContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
 		WITH deadlines AS (
 			SELECT d.id, COALESCE(m.received_at_ns, s.first_expected_at_ns)::numeric + $3::bigint AS deadline,
 				p.receipt
@@ -143,8 +149,11 @@ func (a *application) scanOfflineLocked(ctx context.Context, conn *sql.Conn, atR
 			WHERE receipt IS NULL OR receipt > deadline
 			ORDER BY id
 			ON CONFLICT (device_id, type) WHERE recovered_at_ns IS NULL DO NOTHING
+			RETURNING device_id
 		)
-		SELECT id FROM overdue WHERE receipt <= deadline
+		SELECT id, NULL::text FROM overdue WHERE receipt <= deadline
+		UNION ALL
+		SELECT NULL::text, d.site_id FROM detected JOIN devices d ON d.id = detected.device_id GROUP BY d.site_id
 	`, nowNS, atRestart, offlineTimeout.Nanoseconds(), ids, receipts, targets)
 	if err != nil {
 		return nil, fmt.Errorf("persist offline detections: %w", err)
@@ -152,16 +161,25 @@ func (a *application) scanOfflineLocked(ctx context.Context, conn *sql.Conn, atR
 	defer rows.Close()
 	// 將期限內已有回報的設備交給外層續判，避免等待時仍占用資料庫連線。
 	var deferred []deferredOfflineCheck
+	var sites []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("read deferred offline detection: %w", err)
+		var id, site sql.NullString
+		if err := rows.Scan(&id, &site); err != nil {
+			return nil, fmt.Errorf("read offline scan result: %w", err)
 		}
-		deferred = append(deferred, deferredOfflineCheck{deviceID: id, done: settlements[id]})
+		if site.Valid {
+			sites = append(sites, site.String)
+		} else {
+			deferred = append(deferred, deferredOfflineCheck{deviceID: id.String, done: settlements[id.String]})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("complete offline scan: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit offline scan: %w", err)
+	}
+	a.events.publish(sites...)
 	return deferred, nil
 }
 

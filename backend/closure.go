@@ -78,11 +78,13 @@ func (a *application) closeAlert(ctx context.Context, hash []byte, id int64, res
 
 		// 一筆告警只允許新增一次結果，即使有其他交易已先插入，也不能覆蓋。
 		closedAt := a.measurementClock().UTC()
+		var site string
 		err = tx.QueryRowContext(ctx, `
 			INSERT INTO alert_closures (alert_id, actor, closed_at_ns, result)
 			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (alert_id) DO NOTHING RETURNING alert_id
-		`, id, actor.Username, closedAt.UnixNano(), result).Scan(&id)
+			ON CONFLICT (alert_id) DO NOTHING
+			RETURNING (SELECT site_id FROM devices WHERE id = $5)
+		`, id, actor.Username, closedAt.UnixNano(), result, item.DeviceID).Scan(&site)
 		if errors.Is(err, sql.ErrNoRows) {
 			return errClosureConflict
 		}
@@ -92,9 +94,10 @@ func (a *application) closeAlert(ctx context.Context, hash []byte, id int64, res
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit alert closure: %w", err)
 		}
-		// 只有提交成功才在回應中帶出結案內容。
+		// 只有提交成功才通知設備所屬場域，並在回應中帶出結案內容。
 		item.Status = "closed"
 		item.Closure = &alertClosure{actor.Username, closedAt, result}
+		a.events.publish(site)
 		return nil
 	})
 	return item, err

@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import AlertHistory from './AlertHistory.vue'
+import { liveMessages, parseSessionExpiry, startLiveMonitor } from './live'
 
 type Identity = {
   username: string
   role: 'headquarters' | 'site'
   siteId: string | null
 }
+
+type Session = { identity: Identity; viewer: string; expiresAt: number }
 
 type Device = {
   id: string
@@ -40,6 +43,8 @@ class ApiError extends Error {
 
 const pageSize = 50
 const csrfHeaders = { 'X-CSRF-Protection': '1' }
+const sessionViewHeader = 'X-IOT-Session-View'
+const sessionExpiryHeader = 'X-IOT-Session-Expires-At'
 const onlineStatuses = { unreported: '尚未回報', awaiting: '等待首筆回報', online: '在線', offline: '離線' }
 // 回報時間固定以臺灣時區顯示，避免受瀏覽器所在時區影響。
 const receiptTime = new Intl.DateTimeFormat('zh-TW', {
@@ -83,9 +88,14 @@ const simulationPending = ref(false)
 const simulationReadError = ref('')
 const simulationActionError = ref('')
 const simulationFeedback = ref('')
+const alertHistory = ref<InstanceType<typeof AlertHistory> | null>(null)
+const liveState = ref<keyof typeof liveMessages>('connecting')
 
 let identityGeneration = 0
+let activeSession: Session | null = null
+let logoutViewer: string | null = null
 let detailController: AbortController | null = null
+let liveMonitor: ReturnType<typeof startLiveMonitor> | null = null
 const readControllers = new Set<AbortController>()
 
 // 由後端回傳的筆數與偏移量推導分頁資訊，空清單也保有第一頁。
@@ -100,6 +110,22 @@ const simulationBusy = computed(() =>
   detailLoading.value
   || simulationLoading.value
   || simulationPending.value)
+
+// 手動查詢、寫入及結果確認有自己的畫面狀態，等它們結束後才補讀。
+const canRefreshLive = computed(() => {
+  if (view.value === 'alerts') return alertHistory.value?.liveReady === true
+  if (view.value === 'detail') return !simulationBusy.value && detailController !== null
+  return !devicesLoading.value
+})
+// 結案仍待確認時保留警示，即使串流連線正常。
+const liveMessage = computed(() =>
+  alertHistory.value?.needsVerification
+  && (
+    liveState.value === 'live'
+    || liveState.value === 'syncing'
+  )
+    ? liveMessages.stale
+    : liveMessages[liveState.value])
 
 // 只採用字串型態的 API 錯誤代碼，其他回應交由呼叫端使用備用訊息。
 function errorCode(value: unknown): string {
@@ -126,21 +152,57 @@ async function responseData<T>(response: Response): Promise<T> {
   return await response.json() as T
 }
 
-// 以同源 Cookie 送出寫入，並讓呼叫端依回應判定結果。
-async function writeApi<T>(path: string, init: RequestInit): Promise<T> {
-  const response = await fetch(path, { ...init, credentials: 'same-origin' })
-  return responseData<T>(response)
+// 以同一個成功回應建立身分與期限，避免第二次請求取到另一個分頁換發的 Cookie。
+async function sessionData(response: Response): Promise<Session> {
+  const identity = await responseData<Identity>(response)
+  const viewer = response.headers.get(sessionViewHeader)
+  const expiresAt = parseSessionExpiry(response.headers.get(sessionExpiryHeader))
+  if (
+    !viewer
+    || !/^[A-Za-z0-9_-]{43}$/.test(viewer)
+    || !Number.isFinite(expiresAt)
+  ) throw new Error('Invalid session metadata')
+  return { identity, viewer, expiresAt }
 }
 
-// 將查詢綁定到發出時的身分世代，讓切換身分時可取消並捨棄舊查詢。
-async function readApi<T>(path: string, generation: number, controller = new AbortController()): Promise<T> {
+// viewer 只是原登入的比對值，實際授權仍由同源 Cookie 提供。
+function request(path: string, init: RequestInit, viewer?: string): Promise<Response> {
+  const headers = new Headers(init.headers)
+  if (viewer) headers.set(sessionViewHeader, viewer)
+  return fetch(path, { ...init, headers, credentials: 'same-origin' })
+}
+
+// 讓逾期或舊世代的操作在發送及套用回應前失效。
+function protectedViewer(generation: number): string {
+  if (
+    !activeSession
+    || generation !== identityGeneration
+    || liveMonitor?.expired()
+  ) throw new DOMException('Superseded request', 'AbortError')
+  return activeSession.viewer
+}
+
+// 受保護寫入要比對原登入，即使瀏覽器已因其他分頁換發 Cookie。
+async function writeApi<T>(path: string, init: RequestInit, generation: number): Promise<T> {
+  const result = await responseData<T>(await request(path, init, protectedViewer(generation)))
+  protectedViewer(generation)
+  return result
+}
+
+// 查詢需在取得回應及讀取本文後核對世代和取消狀態。
+async function read<T>(
+  path: string,
+  generation: number,
+  controller: AbortController,
+  viewer: string | undefined,
+  decode: (response: Response) => Promise<T>,
+): Promise<T> {
   readControllers.add(controller)
   try {
-    // 收到回應及解析成功後都確認世代，因為讀取本文期間也可能切換身分。
-    const response = await fetch(path, { credentials: 'same-origin', signal: controller.signal })
-    if (generation !== identityGeneration) throw new DOMException('Superseded request', 'AbortError')
-    const result = await responseData<T>(response)
-    if (generation !== identityGeneration) throw new DOMException('Superseded request', 'AbortError')
+    const response = await request(path, { signal: controller.signal }, viewer)
+    if (generation !== identityGeneration || controller.signal.aborted) throw new DOMException('Superseded request', 'AbortError')
+    const result = await decode(response)
+    if (generation !== identityGeneration || controller.signal.aborted) throw new DOMException('Superseded request', 'AbortError')
     return result
   } finally {
     // 只追蹤仍在處理的查詢，讓後續身分切換能取消它們。
@@ -148,10 +210,21 @@ async function readApi<T>(path: string, generation: number, controller = new Abo
   }
 }
 
+// 所有設備、告警和背景查驗都沿用當前頁面原先驗證過的登入。
+async function readApi<T>(path: string, generation: number, controller = new AbortController()): Promise<T> {
+  const result = await read(path, generation, controller, protectedViewer(generation), responseData<T>)
+  protectedViewer(generation)
+  return result
+}
+
 // 結束目前身分的資料使用期限，讓登入、登出及卸載共用同一個清除入口。
 function clearProtectedState(): number {
   // 先更新世代再取消讀取，讓尚未完成的舊流程失去更新畫面的資格。
   identityGeneration += 1
+  activeSession = null
+  logoutViewer = null
+  liveMonitor?.stop()
+  liveMonitor = null
   for (const controller of readControllers) controller.abort()
   readControllers.clear()
   detailController = null
@@ -209,25 +282,81 @@ function isCurrentIdentity(generation: number): boolean {
 }
 
 // 讀取目前身分可見的設備頁面，並以伺服器回傳的分頁資料更新清單。
-async function loadDevices(nextOffset: number, generation = identityGeneration): Promise<void> {
-  if (!identity.value || generation !== identityGeneration) return
-  devicesLoading.value = true
-  devicesError.value = ''
+async function loadDevices(nextOffset: number, generation = identityGeneration, passive?: AbortController): Promise<boolean> {
+  if (
+    !identity.value
+    || generation !== identityGeneration
+    || devicesLoading.value
+  ) return false
+  if (!passive) {
+    devicesLoading.value = true
+    devicesError.value = ''
+  }
   try {
-    const page = await readApi<DevicePage>(`/api/devices?limit=${pageSize}&offset=${nextOffset}`, generation)
-    if (generation !== identityGeneration) return
+    const page = await readApi<DevicePage>(`/api/devices?limit=${pageSize}&offset=${nextOffset}`, generation, passive)
+    if (generation !== identityGeneration || passive?.signal.aborted) return false
     devices.value = page.items
     total.value = page.total
     offset.value = page.offset
+    devicesError.value = ''
+    return true
   } catch (error) {
     // 只有目前身分的查詢可清除登入狀態或顯示查詢錯誤。
-    if (generation !== identityGeneration || isAbort(error)) return
+    if (generation !== identityGeneration || isAbort(error)) return false
     if (error instanceof ApiError && error.status === 401) expireSession(generation)
-    else devicesError.value = apiMessage(error, '設備清單載入失敗，請重試。')
+    else if (!passive) devicesError.value = apiMessage(error, '設備清單載入失敗，請重試。')
+    return false
   } finally {
     // 舊查詢結束時，保留新身分正在載入的狀態。
-    if (generation === identityGeneration) devicesLoading.value = false
+    if (!passive && generation === identityGeneration) devicesLoading.value = false
   }
+}
+
+// 只查詢目前可見的資料，設備與模擬讀取共用同一輪取消範圍。
+async function refreshLive(generation: number, controller: AbortController): Promise<boolean> {
+  if (view.value === 'alerts') return await alertHistory.value?.refreshLive(controller) ?? false
+  if (view.value === 'list') return loadDevices(offset.value, generation, controller)
+  const deviceLoaded = await refreshDevice(controller)
+  if (!deviceLoaded || controller.signal.aborted) return false
+  if (identity.value?.role !== 'headquarters') return true
+  return loadSimulation(controller)
+}
+
+// 串流失敗不公開 HTTP 狀態，只用同一 viewer 的查詢辨識明確的登入失效。
+async function checkLiveSession(generation: number, controller: AbortController): Promise<void> {
+  try {
+    await readApi<Identity>('/api/session', generation, controller)
+  } catch (error) {
+    if (
+      !controller.signal.aborted
+      && error instanceof ApiError
+      && error.status === 401
+    ) expireSession(generation)
+  }
+}
+
+// 用已驗證的登入先安排絕對期限，再開放畫面與受保護查詢。
+function activateSession(generation: number, session: Session): boolean {
+  if (!isCurrentIdentity(generation)) return false
+  if (session.expiresAt <= Date.now()) {
+    expireSession(generation)
+    return false
+  }
+  activeSession = session
+  liveMonitor = startLiveMonitor({
+    viewer: session.viewer,
+    expiresAt: session.expiresAt,
+    setState: state => {
+      if (isCurrentIdentity(generation)) liveState.value = state
+    },
+    canRefresh: () => isCurrentIdentity(generation) && canRefreshLive.value,
+    refresh: controller => refreshLive(generation, controller),
+    checkSession: controller => checkLiveSession(generation, controller),
+    expire: () => expireSession(generation),
+  })
+  if (liveMonitor.expired()) return false
+  identity.value = session.identity
+  return true
 }
 
 // 重新查驗伺服器上的登入狀態，確認身分後才載入受保護清單。
@@ -237,9 +366,8 @@ async function restoreSession(): Promise<void> {
   sessionError.value = ''
   loginMessage.value = ''
   try {
-    const currentIdentity = await readApi<Identity>('/api/session', generation)
-    if (generation !== identityGeneration) return
-    identity.value = currentIdentity
+    const session = await read('/api/session', generation, new AbortController(), undefined, sessionData)
+    if (!activateSession(generation, session)) return
     initialized.value = true
     await loadDevices(0, generation)
   } catch (error) {
@@ -267,14 +395,13 @@ async function login(): Promise<void> {
   loginMessage.value = ''
   loginPending.value = true
   try {
-    const signedInIdentity = await writeApi<Identity>('/api/login', {
+    const response = await request('/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...csrfHeaders },
       body: JSON.stringify(credentials),
     })
     // 登入結果仍屬於目前世代時，才開放設備清單。
-    if (generation !== identityGeneration) return
-    identity.value = signedInIdentity
+    if (!activateSession(generation, await sessionData(response))) return
     loginPending.value = false
     await loadDevices(0, generation)
   } catch (error) {
@@ -289,23 +416,33 @@ async function login(): Promise<void> {
 
 // 立即清除受保護畫面，再等待伺服器確認登出。
 async function logout(): Promise<void> {
+  const viewer = activeSession?.viewer
   if (
-    !identity.value
+    !viewer
     || logoutPending.value
     || logoutUnconfirmed.value
   ) return
   const generation = clearProtectedState()
+  logoutViewer = viewer
   initialized.value = true
   logoutPending.value = true
   loginMessage.value = '正在登出…'
   try {
-    await writeApi<void>('/api/logout', { method: 'POST', headers: csrfHeaders })
-    if (generation === identityGeneration) loginMessage.value = '已登出。'
-  } catch {
+    await responseData<void>(await request('/api/logout', { method: 'POST', headers: csrfHeaders }, viewer))
+    if (generation === identityGeneration) {
+      logoutViewer = null
+      loginMessage.value = '已登出。'
+    }
+  } catch (error) {
     // 寫入失敗時尚無法確認伺服器的登入狀態，先暫停登入。
     if (generation === identityGeneration) {
-      logoutUnconfirmed.value = true
-      loginMessage.value = '登出結果未確認。請先確認狀態，再繼續登入。'
+      if (error instanceof ApiError && error.status === 401) {
+        logoutViewer = null
+        loginMessage.value = '已確認登出。'
+      } else {
+        logoutUnconfirmed.value = true
+        loginMessage.value = '登出結果未確認。請先確認狀態，再繼續登入。'
+      }
     }
   } finally {
     if (generation === identityGeneration) logoutPending.value = false
@@ -314,8 +451,10 @@ async function logout(): Promise<void> {
 
 // 先讀回登入狀態，仍有有效登入才重新送出登出。
 async function confirmAndRetryLogout(): Promise<void> {
+  const viewer = logoutViewer
   if (
-    !logoutUnconfirmed.value
+    !viewer
+    || !logoutUnconfirmed.value
     || logoutPending.value
     || loginPending.value
   ) return
@@ -323,11 +462,13 @@ async function confirmAndRetryLogout(): Promise<void> {
   logoutPending.value = true
   loginMessage.value = '正在確認登出狀態…'
   try {
-    await readApi<Identity>('/api/session', generation)
+    // 不可將原登入不明的登出結果轉成對新 Cookie 的登出請求。
+    await read('/api/session', generation, new AbortController(), viewer, responseData<Identity>)
     if (generation !== identityGeneration) return
     loginMessage.value = '登入仍有效，正在重新送出登出…'
-    await writeApi<void>('/api/logout', { method: 'POST', headers: csrfHeaders })
+    await responseData<void>(await request('/api/logout', { method: 'POST', headers: csrfHeaders }, viewer))
     if (generation === identityGeneration) {
+      logoutViewer = null
       logoutUnconfirmed.value = false
       loginMessage.value = '已登出。'
     }
@@ -335,6 +476,7 @@ async function confirmAndRetryLogout(): Promise<void> {
     // 伺服器回覆未登入即可開放重新登入，其餘錯誤保留確認入口。
     if (generation !== identityGeneration) return
     if (error instanceof ApiError && error.status === 401) {
+      logoutViewer = null
       logoutUnconfirmed.value = false
       loginMessage.value = '已確認登出。'
     } else {
@@ -347,7 +489,7 @@ async function confirmAndRetryLogout(): Promise<void> {
 }
 
 // 更新目前詳情的設備資料，只接受仍屬於這次詳情的結果。
-async function refreshDevice(): Promise<void> {
+async function refreshDevice(passive?: AbortController): Promise<boolean> {
   const id = selectedDeviceId.value
   const controller = detailController
   const generation = identityGeneration
@@ -355,31 +497,43 @@ async function refreshDevice(): Promise<void> {
     !id
     || !controller
     || detailLoading.value
-  ) return
-  detailError.value = ''
-  detailCanRetry.value = false
-  detailLoading.value = true
+  ) return false
+  if (!passive) {
+    detailError.value = ''
+    detailCanRetry.value = false
+    detailLoading.value = true
+  }
   try {
-    const device = await readApi<Device>(`/api/devices/${encodeURIComponent(id)}`, generation, controller)
-    if (detailController === controller) selectedDevice.value = device
+    const device = await readApi<Device>(`/api/devices/${encodeURIComponent(id)}`, generation, passive ?? controller)
+    if (detailController !== controller || passive?.signal.aborted) return false
+    selectedDevice.value = device
+    detailError.value = ''
+    detailCanRetry.value = false
+    return true
   } catch (error) {
     // 詳情已切換或請求取消時，略過這次查詢的錯誤。
-    if (detailController !== controller || isAbort(error)) return
+    if (
+      detailController !== controller
+      || passive?.signal.aborted
+      || isAbort(error)
+    ) return false
     if (error instanceof ApiError && error.status === 401) expireSession(generation)
     else {
       // 權限遭拒或設備已不存在時，清除先前顯示的設備資料。
-      if (
-        error instanceof ApiError
+      const unavailable = error instanceof ApiError
         && (
           error.status === 403
           || error.status === 404
         )
-      ) selectedDevice.value = null
-      detailError.value = apiMessage(error, '設備資料載入失敗，請重試。')
-      detailCanRetry.value = !(error instanceof ApiError && error.status === 404)
+      if (unavailable) selectedDevice.value = null
+      if (!passive || unavailable) {
+        detailError.value = apiMessage(error, '設備資料載入失敗，請重試。')
+        detailCanRetry.value = !(error instanceof ApiError && error.status === 404)
+      }
     }
+    return false
   } finally {
-    if (detailController === controller) detailLoading.value = false
+    if (!passive && detailController === controller) detailLoading.value = false
   }
 }
 
@@ -399,7 +553,7 @@ function simulationPath(id: string): string {
 }
 
 // 讀取總部畫面所需的模式和控制版本，供下一次手動操作使用。
-async function loadSimulation(): Promise<void> {
+async function loadSimulation(passive?: AbortController): Promise<boolean> {
   const device = selectedDevice.value
   const controller = detailController
   const generation = identityGeneration
@@ -408,19 +562,29 @@ async function loadSimulation(): Promise<void> {
     || !controller
     || identity.value?.role !== 'headquarters'
     || simulationLoading.value
-  ) return
-  simulationReadError.value = ''
-  simulationLoading.value = true
+  ) return false
+  if (!passive) {
+    simulationReadError.value = ''
+    simulationLoading.value = true
+  }
   try {
-    const state = await readApi<Simulation>(simulationPath(device.id), generation, controller)
-    if (detailController === controller) simulation.value = state
+    const state = await readApi<Simulation>(simulationPath(device.id), generation, passive ?? controller)
+    if (detailController !== controller || passive?.signal.aborted) return false
+    simulation.value = state
+    simulationReadError.value = ''
+    return true
   } catch (error) {
     // 保留目前詳情的查詢錯誤供重試，登入失效則交回共用清除流程。
-    if (detailController !== controller || isAbort(error)) return
+    if (
+      detailController !== controller
+      || passive?.signal.aborted
+      || isAbort(error)
+    ) return false
     if (error instanceof ApiError && error.status === 401) expireSession(generation)
-    else simulationReadError.value = apiMessage(error, '模擬狀態載入失敗，請重試。')
+    else if (!passive) simulationReadError.value = apiMessage(error, '模擬狀態載入失敗，請重試。')
+    return false
   } finally {
-    if (detailController === controller) simulationLoading.value = false
+    if (!passive && detailController === controller) simulationLoading.value = false
   }
 }
 
@@ -452,7 +616,7 @@ async function changeSimulation(action: keyof typeof simulationActions): Promise
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...csrfHeaders },
         body: JSON.stringify({ action, version: state.version }),
-      })
+      }, generation)
       if (detailController !== controller) return
       simulation.value = updated
       simulationFeedback.value = simulationActions[action].success
@@ -540,6 +704,15 @@ function navigateTo(section: 'list' | 'alerts'): void {
   view.value = section
 }
 
+// 在舊查詢有機會套用前，同步切斷上一個頁面或手動操作前的被動讀取。
+watch([view, selectedDeviceId, offset, () => alertHistory.value?.liveTarget], () => {
+  liveMonitor?.invalidate(true)
+}, { flush: 'sync' })
+watch(canRefreshLive, ready => {
+  if (ready) liveMonitor?.resume()
+  else liveMonitor?.invalidate()
+}, { flush: 'sync' })
+
 // 掛載時向伺服器查驗身分，卸載時取消查詢並清除受保護資料。
 onMounted(restoreSession)
 onUnmounted(clearProtectedState)
@@ -568,6 +741,16 @@ onUnmounted(clearProtectedState)
       <button type="button" class="button button-secondary" :aria-current="view !== 'alerts' ? 'page' : undefined" :disabled="alertPending" @click="navigateTo('list')">設備清單</button>
       <button type="button" class="button button-secondary" :aria-current="view === 'alerts' ? 'page' : undefined" :disabled="alertPending" @click="navigateTo('alerts')">告警歷程</button>
     </nav>
+
+    <div v-if="identity" class="live-status">
+      <p id="live-status" class="muted" role="status">{{ liveMessage }}</p>
+      <button
+        v-if="liveState === 'disconnected' || liveState === 'stale'"
+        type="button"
+        class="button button-secondary"
+        @click="liveMonitor?.retry()"
+      >重新同步</button>
+    </div>
 
     <section v-if="!initialized" class="panel" aria-live="polite">
       <p>正在確認登入狀態…</p>
@@ -647,6 +830,13 @@ onUnmounted(clearProtectedState)
           <button type="button" class="device-button" @click="openDevice(device.id)">
             <span>{{ device.name }}</span>
             <span class="device-site">{{ device.siteName }}</span>
+            <span class="muted">
+              {{ onlineStatuses[device.onlineStatus] }}
+              <template v-if="device.latestMeasurement">
+                · {{ device.latestMeasurement.temperature }}°C
+                <template v-if="device.onlineStatus === 'offline'">（資料已非即時）</template>
+              </template>
+            </span>
           </button>
         </li>
       </ul>
@@ -660,6 +850,7 @@ onUnmounted(clearProtectedState)
 
     <AlertHistory
       v-else-if="view === 'alerts'"
+      ref="alertHistory"
       :api="alertApi"
       :generation="identityGeneration"
       :receipt-time="receiptTime"
@@ -740,7 +931,7 @@ onUnmounted(clearProtectedState)
           "
           class="muted"
         >{{ noReplayMessage }}</p>
-        <button v-if="simulationReadError" type="button" class="button button-secondary" :disabled="simulationBusy" @click="loadSimulation">重新載入模擬狀態</button>
+        <button v-if="simulationReadError" type="button" class="button button-secondary" :disabled="simulationBusy" @click="loadSimulation()">重新載入模擬狀態</button>
       </section>
     </section>
   </main>
@@ -782,6 +973,8 @@ input { width: 100%; min-height: 2.8rem; padding: 0.6rem 0.75rem; border: 1px so
 .login-panel .button { margin-top: 0.6rem; }
 .section-nav { display: flex; flex-wrap: wrap; gap: 0.65rem; margin-bottom: 1rem; }
 .section-nav [aria-current] { border-color: #246246; background: #edf5ef; }
+.live-status { display: flex; flex-wrap: wrap; align-items: center; gap: 0.65rem; margin-bottom: 1rem; }
+.live-status p { margin: 0; }
 .notice { color: #8a321e; }
 .muted, .device-site { color: #607066; }
 .section-heading { margin-bottom: 1.25rem; }

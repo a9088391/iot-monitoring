@@ -151,15 +151,19 @@ func localOriginHost(origin string) (string, error) {
 	return "", errors.New("IoT startup: IOT_ORIGIN must be http://iot.localhost:<port> with a non-default port")
 }
 
-// serve 管理 HTTP 生命週期與背景巡檢。持鎖連線確認失效時停止服務，避免在失去排他保障後繼續。
-func (a *application) serve(ctx context.Context) error {
-	// 為 HTTP 讀寫與標頭設上限，避免請求無限佔用本機服務資源。
-	server := &http.Server{
+// httpServer 為 HTTP 讀寫與標頭設上限，避免請求無限佔用本機服務資源。
+func (a *application) httpServer() *http.Server {
+	return &http.Server{
 		Addr: ":8080", Handler: a.router(),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second,
 		MaxHeaderBytes: 16 * 1024, ErrorLog: log.New(io.Discard, "", 0),
 	}
+}
+
+// serve 管理 HTTP 生命週期與背景巡檢。持鎖連線確認失效時停止服務，避免在失去排他保障後繼續。
+func (a *application) serve(ctx context.Context) error {
+	server := a.httpServer()
 	// 以緩衝通道回收 HTTP 結果，主迴圈同時負責背景巡檢及關閉。
 	result := make(chan error, 1)
 	go func() { result <- server.ListenAndServe() }()
@@ -170,6 +174,7 @@ func (a *application) serve(ctx context.Context) error {
 		case err := <-result:
 			return operationFailure("serve HTTP on port 8080", err)
 		case <-ctx.Done():
+			a.events.stop()
 			// 使用獨立期限讓既有請求收尾，逾時則強制關閉。
 			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := server.Shutdown(shutdown)

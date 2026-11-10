@@ -175,44 +175,68 @@ func (a *application) account(ctx context.Context, username string) (user identi
 }
 
 // rotateSession 換發隨機 token，讓舊 session 撤銷與新 session 建立原子生效。
-func (a *application) rotateSession(ctx context.Context, username string, previous []byte) (string, error) {
+func (a *application) rotateSession(ctx context.Context, username string, previous []byte) (token string, expiresAt time.Time, err error) {
 	// 產生新 token，只以其雜湊及固定期限寫入資料庫。
-	token := randomSecret()
+	token = randomSecret()
 	hash := sha256.Sum256([]byte(token))
-	err := a.db.use(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		// 撤銷舊 session 和建立新 session 在同一筆交易內生效。
-		_, err := conn.ExecContext(ctx, `
+	err = a.db.use(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		// 同一交易撤銷舊 session、建立新 session，並讀回實際保存的期限。
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin session rotation: %w", err)
+		}
+		defer tx.Rollback()
+		err = tx.QueryRowContext(ctx, `
 			WITH removed AS (
 				DELETE FROM sessions WHERE token_hash = $1 OR expires_at <= statement_timestamp()
 			)
 			INSERT INTO sessions (token_hash, username, expires_at)
 			VALUES ($2, $3, statement_timestamp() + $4::integer * interval '1 second')
-		`, previous, hash[:], username, int(sessionLifetime/time.Second))
-		return err
+			RETURNING expires_at
+		`, previous, hash[:], username, int(sessionLifetime/time.Second)).Scan(&expiresAt)
+		if err != nil {
+			return fmt.Errorf("write session rotation: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit session rotation: %w", err)
+		}
+		// 舊 Cookie 在資料庫失效後，同步取消它的串流。
+		if previous != nil {
+			a.events.revoke(previous)
+		}
+		return nil
 	})
-	return token, err
+	return token, expiresAt, err
 }
 
 // revokeSession 移除指定 token 的雜湊，讓登出立即作用於後端的查詢。
 func (a *application) revokeSession(ctx context.Context, hash []byte) error {
 	return a.db.use(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		// 只有刪除成功才停止對應串流，保留登出失敗時的有效 session。
 		_, err := conn.ExecContext(ctx, "DELETE FROM sessions WHERE token_hash = $1", hash)
+		if err == nil {
+			a.events.revoke(hash)
+		}
 		return err
 	})
 }
 
-const sessionIdentitySQL = `
-	SELECT a.username, a.role, a.site_id
+const sessionSourceSQL = `
 	FROM sessions s JOIN accounts a ON a.username = s.username
 	WHERE s.token_hash = $1 AND s.expires_at > statement_timestamp()
 `
 
-// sessionIdentity 只從未達絕對期限的 session 取得帳號角色與場域。
-func (a *application) sessionIdentity(ctx context.Context, hash []byte) (user identity, err error) {
+const sessionIdentityColumns = "SELECT a.username, a.role, a.site_id"
+const sessionIdentitySQL = sessionIdentityColumns + sessionSourceSQL
+
+// sessionIdentity 只從仍有效的 session 取得帳號角色、場域與實際保存的絕對期限。
+func (a *application) sessionIdentity(ctx context.Context, hash []byte) (user identity, expiresAt time.Time, err error) {
+	// 在同一筆查詢讀取身分與期限，避免換發時把兩次查詢的結果混在一起。
 	err = a.db.use(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		return conn.QueryRowContext(ctx, sessionIdentitySQL, hash).Scan(&user.Username, &user.Role, &user.SiteID)
+		return conn.QueryRowContext(ctx, sessionIdentityColumns+", s.expires_at"+sessionSourceSQL, hash).
+			Scan(&user.Username, &user.Role, &user.SiteID, &expiresAt)
 	})
-	return user, err
+	return user, expiresAt, err
 }
 
 const deviceSource = `
