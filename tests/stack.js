@@ -8,6 +8,7 @@ import { createServer } from 'node:net'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
+import { preparePerformanceConfig } from './performance-fixture.js'
 
 const source = fileURLToPath(new URL('../', import.meta.url))
 
@@ -40,7 +41,7 @@ async function localPort() {
 }
 
 // 只繼承工具執行所需的環境，並以同一個本機 socket 操作測試資源。
-export async function createStack() {
+export async function createStack({ performance = false } = {}) {
   // 每套測試各自配置專案名稱與暫存根目錄，隔離資料卷和應用程式。
   const suite = mkdtempSync(join(realpathSync('/tmp'), 'iot01-suite-'))
   const project = `iot01_test_${randomBytes(8).toString('hex')}`
@@ -49,6 +50,7 @@ export async function createStack() {
   let owned = false
   let database
   let application
+  let performanceRuntime
   // 直接操作 Compose 的命令也須沿用啟動時的資源標籤，避免觸發重建。
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: root, IOT_PROJECT_ROOT: root }
   const logs = []
@@ -80,14 +82,14 @@ export async function createStack() {
   const compose = (args, phase, options) =>
     docker(['compose', '-p', project, '-f', config, ...args], phase, options)
 
-  // 只清理已取得歸屬的 Compose 資源，驗證清理後再移除暫存目錄。
-  function cleanup() {
+  // 只清理已取得歸屬的 Compose 資源；證據複製失敗時保留私有暫存原件。
+  function cleanup({ retainSuite = false } = {}) {
     if (owned) {
       compose(['down', '--volumes', '--rmi', 'local', '--timeout', '10'], `清除測試專案 ${project}`)
       assertIsolated()
       owned = false
     }
-    rmSync(suite, { recursive: true, force: true })
+    if (!retainSuite) rmSync(suite, { recursive: true, force: true })
   }
 
   // 依資源名稱與 Compose 標籤分別查找，避免碰撞，也能發現清理殘留。
@@ -128,6 +130,7 @@ export async function createStack() {
     ]) copy(root, file)
     // 重設入口會直接執行啟動器，暫存複本也須保有執行權限。
     chmodSync(join(root, 'bin/start'), 0o700)
+    if (performance) preparePerformanceConfig(root, project)
 
     // 驗證端點確實是本機 socket，再確認名稱無衝突，才取得清理權。
     const context = docker(['context', 'show'], '查詢 Docker context').trim()
@@ -240,6 +243,27 @@ export async function createStack() {
     // 所有隔離檢查通過後才保存容器識別，讓 SQL 只能操作已驗證目標。
     application = app.id
     database = db.id
+    if (performance) {
+      performanceRuntime = {
+        namespace: project,
+        daemon: JSON.parse(docker(['version', '--format', '{{json .Server}}'], '記錄隔離 Docker 版本')),
+        app: performanceQuota(app.id),
+        db: performanceQuota(db.id),
+      }
+    }
+  }
+
+  // 驗證實際容器設定及執行中的 cgroup 上限，避免用宣告值充當量測環境。
+  function performanceQuota(id) {
+    const configured = docker(['container', 'inspect', '--format', '{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}', id],
+      '確認實際容器配額').trim()
+    assert.equal(configured, '2000000000|2147483648', '單一容器上限須為 2 vCPU 與 2 GiB')
+    const cgroup = docker(['exec', id, 'cat', '/sys/fs/cgroup/cpu.max', '/sys/fs/cgroup/memory.max'],
+      '確認執行中容器配額').trim()
+    const [quota, period, memory] = cgroup.split(/\s+/).map(Number)
+    assert.equal(quota / period, 2, '實際 cgroup CPU 上限須為 2 vCPU')
+    assert.equal(memory, 2147483648, '實際 cgroup 記憶體上限須為 2 GiB')
+    return { id, configured, cgroup }
   }
 
   // 以已驗證的容器執行 SQL，任何 SQL 錯誤都須使子程序失敗。
@@ -378,5 +402,6 @@ exec "$IOT_FIXTURE_DOCKER" "$@"
   return {
     origin, loopbackOrigin, state, send, start, sql, stop, reset, resetResources, resetWithStopBarrier,
     cleanup, secondInstance, collectLogs, logs,
+    performanceRuntime: () => performanceRuntime,
   }
 }

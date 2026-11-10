@@ -565,7 +565,7 @@ func scanWithOfflinePending(t *testing.T, f *offlineTestFixture, target measurem
 	first := samples[0]
 	f.setTime(first.GeneratedAt)
 	// 先占住設備的入列順序，讓真實回報在掃描取得資料庫連線前已抵達。
-	blocker := f.app.receiveMeasurement(first.DeviceID, first.GeneratedAt)
+	blocker, _ := f.app.receiveMeasurement(first.DeviceID, first.GeneratedAt)
 	if blocker == nil {
 		t.Fatal("could not establish pending report fixture")
 	}

@@ -52,7 +52,13 @@ func (a *application) measurementClock() time.Time {
 }
 
 // SubmitMeasurement 在入列前記錄抵達時間，只有最新測量與相關告警完整提交才回傳採用成功。
-func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement) (adopted bool, err error) {
+func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement) (bool, error) {
+	adopted, _, err := a.submitMeasurement(ctx, sample)
+	return adopted, err
+}
+
+// submitMeasurement 另外回傳入口取得的抵達時間，讓隔離量測與資料庫使用同一時間基準。
+func (a *application) submitMeasurement(ctx context.Context, sample Measurement) (adopted bool, received time.Time, err error) {
 	// 先排除來源、欄位與時間表示無效的資料，避免占用設備佇列。
 	generated := sample.GeneratedAt.UTC()
 	generatedNS := generated.UnixNano()
@@ -64,21 +70,20 @@ func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement)
 		math.IsNaN(sample.Temperature) ||
 		math.IsInf(sample.Temperature, 0) ||
 		!time.Unix(0, generatedNS).Equal(generated) {
-		return false, nil
+		return false, time.Time{}, nil
 	}
 	// 記錄抵達時間並等同設備的前一筆完成。逾時離開也會釋放這筆排隊紀錄。
-	report := a.receiveMeasurement(sample.DeviceID, generated)
+	report, received := a.receiveMeasurement(sample.DeviceID, generated)
 	if report == nil {
-		return false, nil
+		return false, received, nil
 	}
 	defer a.arrivals.release(sample.DeviceID, report)
-	received := report.received
 	ctx, cancel := context.WithTimeout(ctx, dbOperationTimeout)
 	defer cancel()
 	select {
 	case <-report.ready:
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return false, received, ctx.Err()
 	}
 
 	// 在持鎖連線內確認採用資格並寫入，任一步失敗則回滾。
@@ -174,7 +179,7 @@ func (a *application) SubmitMeasurement(ctx context.Context, sample Measurement)
 		adopted = true
 		return nil
 	})
-	return adopted, err
+	return adopted, received, err
 }
 
 // lockMeasurementAlerts 以固定順序鎖定兩類未恢復告警，讓採用交易能分別更新溫度和離線狀態。

@@ -129,3 +129,17 @@ data: {"version":"12","viewer":"<session-view>","expiresAt":"2026-01-01T00:00:00
 ./bin/test-measurements sse
 ./bin/test-measurements reset
 ```
+
+## 效能驗收
+
+在已登入桌面的 Mac 上準備本機 Docker、Node.js 24.22.2 與 Chrome，先在 `tests` 執行 `npm ci`，再回到專案根目錄。正式量測需要能同時露出十個 Chrome 視窗的桌面。執行期間保持測試視窗在前景，避免鎖定螢幕或切換工作區。`caffeinate` 只在這次指令執行時保持螢幕與主機清醒。
+
+```sh
+caffeinate -di node tests/performance.js
+```
+
+指令建置隔離的 Compose 專案。應用與 PostgreSQL 各限制在 2 vCPU／2 GiB，啟動後再核對實際容器配額。負載由同一應用程序內的正式採用入口處理。100 台設備各每五秒回報一次，錯開為每秒 20 筆，暖機 60 秒後量測 300 秒。離線、恢復觀看及無效回報在正式計數後另測。程式會以十個獨立 Chrome 設定檔開啟已登入、可見的原生視窗，以原生捲動把變動的列帶入視窗，逐筆核對文字在未遮蔽區域的繪製時間。
+
+指令會印出證據目錄。以其中的 `report.json` 判讀 `PASS`、`FAIL` 或 `INCOMPLETE`，並查閱逐筆採用、繪製、時基區間、容器配額與主機紀錄。每筆必要顯示以含校時誤差的延遲上界核對兩秒門檻。缺樣、超時、拒絕及漏排程均會保留。只有正式量測通過會以結束碼 0 返回。
+
+可加 `--probe` 核對隔離堆疊、配額、校時和十個真實視窗是否可用。探查不送出正式負載，即使 `probePassed` 為真，仍回報 `INCOMPLETE`。測試結束後清理本次隔離容器與資料卷，證據目錄保留。

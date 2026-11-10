@@ -120,6 +120,11 @@ func lockIoTDatabase(ctx context.Context, conn *sql.Conn) error {
 
 // run 取得本案的 PostgreSQL 啟動鎖，完成初始化與重啟補判後才接受 HTTP 請求。
 func run(ctx context.Context) error {
+	return runApplication(ctx, nil, nil)
+}
+
+// runApplication 保持正式啟動順序，測試可在任何資料寫入前核對隔離目標並準備夾具。
+func runApplication(ctx context.Context, check func(context.Context, *sql.Conn, *os.Root) error, setup func(context.Context, *application, *os.Root) (func(), error)) error {
 	origin := os.Getenv("IOT_ORIGIN")
 	host, err := localOriginHost(origin)
 	if err != nil {
@@ -148,8 +153,19 @@ func run(ctx context.Context) error {
 		return operationFailure("connect to PostgreSQL", err)
 	}
 	defer conn.Close()
+	// 先確認測試目標才取鎖，取鎖後再查一次，避免兩次啟動之間的狀態變更。
+	if check != nil {
+		if err := check(startup, conn, state); err != nil {
+			return err
+		}
+	}
 	if err := lockIoTDatabase(startup, conn); err != nil {
 		return err
+	}
+	if check != nil {
+		if err := check(startup, conn, state); err != nil {
+			return err
+		}
 	}
 	// 先準備資料並停用舊模擬執行，再依保留的計時基準補判離線。
 	if err := bootstrap(startup, conn, state); err != nil {
@@ -165,6 +181,14 @@ func run(ctx context.Context) error {
 	}
 	if err := a.scanOffline(startup, true); err != nil {
 		return operationFailure("detect offline devices on startup", err)
+	}
+	// 服務結束時先停止測試工作，再釋放正式資料庫連線和狀態目錄。
+	if setup != nil {
+		cleanup, err := setup(startup, &a, state)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
 	}
 	// 解除啟動期限，以服務生命週期管理後續模擬。
 	cancel()

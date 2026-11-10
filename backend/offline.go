@@ -25,14 +25,14 @@ type pendingMeasurements struct {
 }
 
 // receiveMeasurement 依同設備抵達順序入列，讓逾時掃描可看見尚未取得資料庫連線的回報。
-func (a *application) receiveMeasurement(id string, generated time.Time) *pendingMeasurement {
+func (a *application) receiveMeasurement(id string, generated time.Time) (*pendingMeasurement, time.Time) {
 	p := &a.arrivals
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// 在鎖內取抵達時間及檢查新鮮度，使掃描看到同一界線下的時間與佇列。
 	received := a.measurementClock().UTC()
 	if !freshMeasurement(generated, received) || !time.Unix(0, received.UnixNano()).Equal(received) {
-		return nil
+		return nil, received
 	}
 	if p.devices == nil {
 		p.devices = make(map[string][]*pendingMeasurement)
@@ -43,7 +43,7 @@ func (a *application) receiveMeasurement(id string, generated time.Time) *pendin
 		close(report.ready)
 	}
 	p.devices[id] = append(p.devices[id], report)
-	return report
+	return report, received
 }
 
 // release 結束一筆排隊回報並通知掃描，只在移除隊首時放行下一筆以維持順序。
