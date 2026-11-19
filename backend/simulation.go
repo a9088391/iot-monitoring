@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math"
 	"net/http"
@@ -70,7 +71,7 @@ func (s *simulator) deliver(ctx context.Context, sample Measurement) {
 }
 
 // startRun 在控制交易提交後啟動設備自己的週期，舊計時器不可覆蓋新執行的原始回報。
-func (s *simulator) startRun(device *simulatedDevice, first Measurement) {
+func (s *simulator) startRun(device *simulatedDevice, first Measurement, normal bool) {
 	ctx, cancel := context.WithCancel(s.ctx)
 	run := &simulationRun{cancel: cancel}
 	device.latest, device.run = &first, run
@@ -97,6 +98,9 @@ func (s *simulator) startRun(device *simulatedDevice, first Measurement) {
 				}
 				sample.Sequence++
 				sample.GeneratedAt = tick.UTC()
+				if normal {
+					sample.Temperature = normalSimulationTemperature(sample.DeviceID, sample.Sequence)
+				}
 				device.latest = &sample
 				s.mu.Unlock()
 
@@ -105,6 +109,105 @@ func (s *simulator) startRun(device *simulatedDevice, first Measurement) {
 			}
 		}
 	})
+}
+
+// normalSimulationTemperature 將每次 0.1 度的往返變化限制在 0～0.2 度，讓六台不同步時也不會撞值。
+func normalSimulationTemperature(id string, sequence int64) float64 {
+	hash := fnv.New32a()
+	hash.Write([]byte(id))
+	baseline := int64(200 + hash.Sum32()%51)
+	step := sequence % 4
+	if step > 2 {
+		step = 4 - step
+	}
+	return float64(baseline+step) / 10
+}
+
+// startDemoSimulations 只啟動產品的六台種子設備；自動啟動沒有人工操作者，不寫入總部控制歷程。
+func (a *application) startDemoSimulations(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var first []Measurement
+	err := a.db.use(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin automatic simulation startup: %w", err)
+		}
+		defer tx.Rollback()
+		// 一次讀取種子設備的持久順序與版本，先驗證全部設備才保存新的執行資格。
+		rows, err := tx.QueryContext(ctx, `
+			SELECT d.id, g.generation, COALESCE(s.version, 0), COALESCE(m.sequence, -1)
+			FROM devices d CROSS JOIN public.iot_data_generation g
+			LEFT JOIN device_simulations s ON s.device_id = d.id
+			LEFT JOIN latest_measurements m ON m.device_id = d.id
+			WHERE g.singleton AND d.id IN ('north-01', 'north-02', 'north-03', 'south-01', 'south-02', 'south-03')
+			ORDER BY d.id
+		`)
+		if err != nil {
+			return fmt.Errorf("read automatic simulation devices: %w", err)
+		}
+		for rows.Next() {
+			sample := Measurement{Source: SimulatorMeasurementSource}
+			if err := rows.Scan(&sample.DeviceID, &sample.DataGeneration, &sample.RunID, &sample.Sequence); err != nil {
+				rows.Close()
+				return fmt.Errorf("read automatic simulation state: %w", err)
+			}
+			if sample.RunID == math.MaxInt64 || sample.Sequence == math.MaxInt64 {
+				rows.Close()
+				return errors.New("automatic simulation version or sequence exhausted")
+			}
+			sample.RunID++
+			sample.Sequence++
+			sample.Temperature = normalSimulationTemperature(sample.DeviceID, sample.Sequence)
+			first = append(first, sample)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return fmt.Errorf("finish reading automatic simulation devices: %w", err)
+		}
+		nowNS := a.measurementClock().UnixNano()
+		for _, sample := range first {
+			if _, err := tx.ExecContext(ctx, `
+				WITH saved AS (
+					INSERT INTO device_simulations (device_id, mode, version, first_expected_at_ns)
+					VALUES ($1, 'normal', $2, $3)
+					ON CONFLICT (device_id) DO UPDATE SET mode = excluded.mode, version = excluded.version,
+						first_expected_at_ns = COALESCE(device_simulations.first_expected_at_ns, excluded.first_expected_at_ns)
+					RETURNING device_id
+				)
+				INSERT INTO measurement_runs (device_id, data_generation, run_id) SELECT device_id, $4, $2 FROM saved
+				ON CONFLICT (device_id) DO UPDATE SET data_generation = excluded.data_generation, run_id = excluded.run_id
+			`, sample.DeviceID, sample.RunID, nowNS, sample.DataGeneration); err != nil {
+				return fmt.Errorf("save automatic simulation run: %w", err)
+			}
+		}
+		return operationFailure("commit automatic simulation startup", tx.Commit())
+	})
+	if err != nil {
+		return err
+	}
+	// 全部首筆都經正式入口採用後才開計時器，啟動失敗不留下半套背景工作。
+	for i := range first {
+		first[i].GeneratedAt = a.measurementClock().UTC()
+		adopted, err := a.simulator.submit(ctx, first[i])
+		if err != nil {
+			return fmt.Errorf("submit automatic simulation first report: %w", err)
+		}
+		if !adopted {
+			return errors.New("automatic simulation first report was not adopted")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	a.simulator.mu.Lock()
+	defer a.simulator.mu.Unlock()
+	for _, sample := range first {
+		device := &simulatedDevice{}
+		a.simulator.devices[sample.DeviceID] = device
+		a.simulator.startRun(device, sample, true)
+	}
+	return nil
 }
 
 // stopSimulationsOnStartup 在啟動時一起停止各裝置的模擬並撤銷舊執行資格，避免舊回報在重啟後生效。
@@ -288,7 +391,7 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 			if device.run != nil {
 				device.run.cancel()
 			}
-			temperature := 23.0
+			temperature := normalSimulationTemperature(id, sequence+1)
 			if action == "abnormal" {
 				temperature = 30
 			}
@@ -297,7 +400,7 @@ func (a *application) changeSimulation(request context.Context, id string, hash 
 				RunID: next, Sequence: sequence + 1, GeneratedAt: a.measurementClock().UTC(), Temperature: temperature,
 			}
 			s.devices[id] = device
-			s.startRun(device, *outgoing)
+			s.startRun(device, *outgoing, action == "normal")
 		case action == "stop":
 			if device.run != nil {
 				device.run.cancel()

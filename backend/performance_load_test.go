@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +38,8 @@ type performanceEvent struct {
 	Sequence    int64   `json:"sequence"`
 	Temperature float64 `json:"temperature"`
 	PlannedNS   string  `json:"plannedNs"`
+	WakeNS      string  `json:"wakeNs"`
+	MonoLagNS   string  `json:"monoLagNs"`
 	SentNS      string  `json:"sentNs,omitempty"`
 	EntryNS     string  `json:"entryNs,omitempty"`
 	ResultNS    string  `json:"resultNs,omitempty"`
@@ -98,16 +103,35 @@ func performanceSample(device performanceDevice, index int, sequence int64, gene
 }
 
 // recordPerformanceLoad 將每個結果立即寫入證據檔，排程從不等待採用或主機讀取。
-func recordPerformanceLoad(ctx context.Context, app *application, state *os.Root, devices []performanceDevice, start time.Time) (int, error) {
+func recordPerformanceLoad(ctx context.Context, app *application, state *os.Root, devices []performanceDevice, start time.Time) (result performanceRunResult, resultErr error) {
+	// 證據或摘要錯誤也必須使完整性失敗，不讓缺少觀測的量測輪誤報完成。
+	defer func() {
+		result.Complete = resultErr == nil
+		if resultErr != nil {
+			result.Error = resultErr.Error()
+		}
+	}()
+	diagnostic := &performanceDiagnosticResult{}
+	result.Diagnostics = diagnostic
+	var err error
+	diagnostic.Start, err = performanceRuntime()
+	if err != nil {
+		return result, err
+	}
+	defer func() {
+		var err error
+		diagnostic.End, err = performanceRuntime()
+		resultErr = errors.Join(resultErr, err)
+	}()
 	file, err := state.OpenFile(performanceEvents, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return 0, errors.New("performance fixture: open event evidence")
+		return result, errors.New("performance fixture: open event evidence")
 	}
 	started := struct {
 		StartNS string `json:"startNs"`
 	}{performanceNS(start)}
 	if err := writePerformanceJSON(state, performanceStarted, started, false); err != nil {
-		return 0, errors.Join(err, file.Close())
+		return result, errors.Join(err, file.Close())
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -119,7 +143,6 @@ func recordPerformanceLoad(ctx context.Context, app *application, state *os.Root
 		pacer <- pacePerformanceLoad(ctx, app, plans, events)
 		close(events)
 	}()
-	count := 0
 	var writeErr error
 	encoder := json.NewEncoder(file)
 	for event := range events {
@@ -131,12 +154,34 @@ func recordPerformanceLoad(ctx context.Context, app *application, state *os.Root
 			cancel()
 			continue
 		}
-		count++
+		result.Events++
+		if event.Outcome == "missed" && diagnostic.FirstMiss == nil {
+			diagnostic.FirstMiss = &event
+			snapshot, err := performanceRuntime()
+			diagnostic.FirstMissObserved = &snapshot
+			if err != nil {
+				writeErr = errors.Join(writeErr, err)
+				cancel()
+			}
+		}
 	}
 	if err := errors.Join(file.Sync(), file.Close()); err != nil {
 		writeErr = errors.Join(writeErr, errors.New("performance fixture: flush event evidence"))
 	}
-	return count, errors.Join(<-pacer, writeErr)
+	return result, errors.Join(<-pacer, writeErr)
+}
+
+// waitPerformanceDeadline 不依賴一次 timer 喚醒；在原應用 CPU 配額內主動等待並讓其他工作進展。
+func waitPerformanceDeadline(ctx context.Context, deadline time.Time) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return nil
+		}
+		runtime.Gosched()
+	}
 }
 
 // pacePerformanceLoad 每次依單調時計的絕對時間發出，不因資料庫繁忙挪動後續時槽。
@@ -144,20 +189,19 @@ func pacePerformanceLoad(ctx context.Context, app *application, plans []performa
 	active := make(chan struct{}, performanceInFlight)
 	var workers sync.WaitGroup
 	defer workers.Wait()
-	timer := time.NewTimer(time.Hour)
-	defer timer.Stop()
 	for _, plan := range plans {
-		timer.Reset(time.Until(plan.at))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+		if err := waitPerformanceDeadline(ctx, plan.at); err != nil {
+			return err
 		}
 		event := performanceEvent{
 			Phase: plan.phase, Slot: plan.slot, DeviceID: plan.sample.DeviceID, Sequence: plan.sample.Sequence,
 			Temperature: plan.sample.Temperature, PlannedNS: performanceNS(plan.at),
 		}
-		if time.Since(plan.at) >= performanceInterval {
+		// 在原逾期檢查點取一次時間，同一值同時決定漏槽與記錄證據，並非核心計時器的觸發時間。
+		wake := time.Now()
+		lag := wake.Sub(plan.at)
+		event.WakeNS, event.MonoLagNS = performanceNS(wake), strconv.FormatInt(int64(lag), 10)
+		if lag >= performanceInterval {
 			event.Outcome, event.Error = "missed", "scheduler late by at least one slot"
 			events <- event
 			continue
@@ -245,6 +289,10 @@ func TestPerformancePacerKeepsMisses(t *testing.T) {
 	}
 	select {
 	case got := <-events:
+		lag, err := strconv.ParseInt(got.MonoLagNS, 10, 64)
+		if err != nil || lag < int64(performanceInterval) || got.WakeNS == "" {
+			t.Fatalf("missed slot lacks actual wake and monotonic delay: %+v", got)
+		}
 		if got.Outcome != "missed" ||
 			got.Slot != 1200 ||
 			got.PlannedNS == "" ||
@@ -254,5 +302,141 @@ func TestPerformancePacerKeepsMisses(t *testing.T) {
 		}
 	default:
 		t.Fatal("missed slot was not recorded")
+	}
+}
+
+// TestPerformanceRecordDoesNotStartTrace 鎖定正式量測只保存輕量摘要，不建立會擾動排程的 trace。
+func TestPerformanceRecordDoesNotStartTrace(t *testing.T) {
+	if _, err := os.Stat("/sys/fs/cgroup/cpu.stat"); err != nil {
+		t.Skip("requires the Linux cgroup performance fixture")
+	}
+	state, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	result, err := recordPerformanceLoad(t.Context(), nil, state, make([]performanceDevice, performanceDeviceCount), time.Now().Add(-time.Hour))
+	if err != nil || !result.Complete || result.Events != 7698 {
+		t.Fatalf("expired result=%+v err=%v", result, err)
+	}
+	if _, err := state.Stat("performance-scheduler.trace"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("qualification unexpectedly created runtime trace: %v", err)
+	}
+	d := result.Diagnostics
+	if d == nil || d.FirstMiss == nil || d.FirstMissObserved == nil || d.FirstMiss.Slot != 0 || d.FirstMiss.SentNS != "" || d.FirstMiss.EntryNS != "" {
+		t.Fatalf("missing first observed miss: %+v", d)
+	}
+	for _, snapshot := range []performanceRuntimeSnapshot{d.Start, *d.FirstMissObserved, d.End} {
+		begin, beginErr := strconv.ParseInt(snapshot.BeginNS, 10, 64)
+		end, endErr := strconv.ParseInt(snapshot.EndNS, 10, 64)
+		if beginErr != nil || endErr != nil || end < begin || snapshot.GCCount == nil || snapshot.Error != "" ||
+			!strings.Contains(snapshot.CPUStat, "usage_usec ") || (!strings.Contains(snapshot.CPUStatLocal, "throttled_usec ") && !strings.HasPrefix(snapshot.CPUStatLocal, "UNAVAILABLE: ")) {
+			t.Fatalf("invalid bounded runtime snapshot: %+v", snapshot)
+		}
+	}
+	data, err := state.ReadFile(performanceEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 7698 {
+		t.Fatalf("expired evidence count=%d", len(lines))
+	}
+	for _, line := range lines {
+		var event performanceEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Outcome != "missed" || event.SentNS != "" || event.EntryNS != "" || event.ResultNS != "" {
+			t.Fatalf("expired slot submitted: %+v", event)
+		}
+	}
+}
+
+// TestPerformanceDeadlineWaiter 直接驗證共用等待器不早返、取消優先，以及單 P 下同儕仍能取消等待。
+func TestPerformanceDeadlineWaiter(t *testing.T) {
+	t.Run("future-not-early", func(t *testing.T) {
+		deadline := time.Now().Add(10 * time.Millisecond)
+		if err := waitPerformanceDeadline(t.Context(), deadline); err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().Before(deadline) {
+			t.Fatal("waiter returned before the absolute deadline")
+		}
+	})
+	t.Run("pre-cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := waitPerformanceDeadline(ctx, time.Now().Add(-time.Hour)); !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	})
+	t.Run("peer-cancel-single-p", func(t *testing.T) {
+		previous := runtime.GOMAXPROCS(1)
+		defer runtime.GOMAXPROCS(previous)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan struct{})
+		go func() { cancel(); close(done) }()
+		if err := waitPerformanceDeadline(ctx, time.Now().Add(time.Hour)); !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+		<-done
+	})
+	t.Run("empty-pacer", func(t *testing.T) {
+		if err := pacePerformanceLoad(t.Context(), nil, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestPerformanceWorkerKeepsDeadlineBoundary 即使 pacer 準時，worker 達到完整一槽仍不得送出或補送。
+func TestPerformanceWorkerKeepsDeadlineBoundary(t *testing.T) {
+	planned := time.Now()
+	app := &application{measurementNow: func() time.Time { return planned.Add(performanceInterval) }}
+	event := submitPerformanceSample(t.Context(), app, performancePlan{at: planned}, performanceEvent{})
+	if event.Outcome != "missed" || event.Error != "submission worker late by at least one slot" ||
+		event.SentNS != "" || event.EntryNS != "" || event.ResultNS != "" {
+		t.Fatalf("deadline boundary submitted a measurement: %+v", event)
+	}
+}
+
+// TestPerformanceRecordFailures 確認取消與既有證據檔錯誤仍回不完整，且不覆寫先前原件。
+func TestPerformanceRecordFailures(t *testing.T) {
+	if _, err := os.Stat("/sys/fs/cgroup/cpu.stat"); err != nil {
+		t.Skip("requires the Linux cgroup performance fixture")
+	}
+	for _, scenario := range []string{"cancel", "existing-events"} {
+		t.Run(scenario, func(t *testing.T) {
+			state, err := os.OpenRoot(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			ctx := t.Context()
+			if scenario == "cancel" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			} else if err := state.WriteFile(performanceEvents, []byte("keep"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			result, err := recordPerformanceLoad(ctx, nil, state, make([]performanceDevice, performanceDeviceCount), time.Now().Add(time.Hour))
+			if err == nil || result.Complete || result.Error == "" || result.Events != 0 {
+				t.Fatalf("failure reported complete: %+v err=%v", result, err)
+			}
+			if scenario == "cancel" && !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if scenario == "existing-events" {
+				data, err := state.ReadFile(performanceEvents)
+				if err != nil || string(data) != "keep" {
+					t.Fatalf("existing evidence overwritten: %q err=%v", data, err)
+				}
+			}
+			if result.Diagnostics == nil || result.Diagnostics.FirstMiss != nil {
+				t.Fatalf("failure fabricated a missed slot: %+v", result.Diagnostics)
+			}
+		})
 	}
 }

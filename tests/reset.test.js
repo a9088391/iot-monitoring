@@ -94,6 +94,12 @@ test('IoT 票 07：本機重設守門、交易回滾與瀏覽器舊登入失效'
   }
 
   const { cookie: oldCookie } = await login('hq')
+  // 本檔核對取消/回滾的精確持久化快照，明確停六台timer；真實boot預設另由automatic.test驗證。
+  for (const id of devices) {
+    const path = `/api/devices/${id}/simulation`
+    const state = await json(await send(path, oldCookie), 200, '回滾夾具讀取版本')
+    await json(await send(path, oldCookie, { action: 'stop', version: state.version }), 200, '固定回滾夾具')
+  }
   await control(oldCookie, 'abnormal')
   await control(oldCookie, 'normal')
   await control(oldCookie, 'stop')
@@ -175,7 +181,11 @@ test('IoT 票 07：本機重設守門、交易回滾與瀏覽器舊登入失效'
   assert.deepEqual(recovered.db, originalResources.db)
   assert.deepEqual(recovered.volume, originalResources.volume)
   assert.equal((await send(sessionPath, oldCookie)).status, 200)
-  assert.equal(preservedData(), originalData)
+  const restartedDevices = await json(await send('/api/devices', oldCookie), 200, '失敗重設後重啟自動首報')
+  assert.deepEqual(restartedDevices.items.map(item => item.id), devices)
+  assert.ok(restartedDevices.items.every(item => item.onlineStatus === 'online' && item.latestMeasurement.temperature >= 18
+    && item.latestMeasurement.temperature <= 28))
+  assert.deepEqual(await json(await send(`${alertsPath}/${oldAlert.id}`, oldCookie), 200, '重啟仍保留原結案'), closed)
 
   await control(oldCookie, 'abnormal')
   assert.equal(stack.sql("SELECT data_generation FROM measurement_runs WHERE device_id = 'north-01';"), generation)
@@ -230,7 +240,7 @@ test('IoT 票 07：本機重設守門、交易回滾與瀏覽器舊登入失效'
     await network.send('Network.enable')
     const [[frame]] = await Promise.all([
       once(network, 'Network.eventSourceMessageReceived', { signal: AbortSignal.timeout(8_000) }),
-      page.goto(stack.origin),
+      page.goto(stack.origin + '/?view=simulation'),
     ])
     assert.equal(frame.eventName, 'version')
     const stream = new EventEmitter()
@@ -244,7 +254,9 @@ test('IoT 票 07：本機重設守門、交易回滾與瀏覽器舊登入失效'
     network.on('Network.loadingFinished', observeEnd)
     network.on('Network.loadingFailed', observeEnd)
     await history.press('Enter')
-    await page.getByRole('button', { name: new RegExp(`#${oldAlert.id} · 溫度異常 · north-01`) }).click()
+    await page.getByRole('region', { name: '告警歷程', exact: true }).getByRole('button')
+      .filter({ has: page.getByText(`#${oldAlert.id} 溫度異常`, { exact: true }) })
+      .filter({ has: page.getByText('north-01', { exact: true }) }).click()
     await privateNote.waitFor()
     await live.waitFor()
     assert.equal(streamClosed, false, '重設前應仍持有原先的 SSE 連線')
@@ -294,7 +306,7 @@ test('IoT 票 07：本機重設守門、交易回滾與瀏覽器舊登入失效'
     const counts = JSON.parse(stack.sql(
       `SELECT json_build_array(${resetTables.map(table => `(SELECT count(*) FROM ${table})`).join(',')});`,
     ))
-    assert.deepEqual(counts, [2, 6, 3, 0, 0, 0, 0, 0, 0, 0, 0], '重設後須只保留預載場域、設備與帳號')
+    assert.deepEqual(counts, [2, 6, 3, 6, 6, 0, 0, 6, 0, 0, 0], '重設後只保留預載資料與六筆新首報，不能保留舊告警或人類歷史')
 
     // 同一個瀏覽器用原密碼重新登入，確認私有歷程已換成重設後的空狀態。
     try {
@@ -305,7 +317,7 @@ test('IoT 票 07：本機重設守門、交易回滾與瀏覽器舊登入失效'
     } catch {
       throw new Error('重設後的瀏覽器登入操作失敗')
     }
-    await page.getByRole('button', { name: /北區設備 01.*尚未回報/ }).waitFor()
+    await page.getByRole('button', { name: /北區設備 01.*在線/ }).waitFor()
     await live.waitFor()
     await history.press('Enter')
     await page.getByText('目前沒有可查看的告警。', { exact: true }).waitFor()
@@ -324,15 +336,17 @@ test('IoT 票 07：本機重設守門、交易回滾與瀏覽器舊登入失效'
     const inventory = await json(await send('/api/devices', currentCookie), 200, '重設後查閱全部設備')
     assert.deepEqual(inventory.items.map(item => item.id), devices)
     for (const item of inventory.items) {
-      assert.equal(item.onlineStatus, 'unreported')
-      assert.equal(item.latestMeasurement, undefined)
+      assert.equal(item.onlineStatus, 'online')
+      assert.ok(item.latestMeasurement.temperature >= 18 && item.latestMeasurement.temperature <= 28)
       const simulation = await json(await send(`/api/devices/${item.id}/simulation`, currentCookie), 200, '重設後模擬狀態')
-      assert.deepEqual(simulation, { mode: 'stopped', version: '0', canReplay: false })
+      assert.equal(simulation.mode, 'normal')
+      assert.equal(simulation.canReplay, true)
+      assert.ok(BigInt(simulation.version) > 0n)
     }
     await control(currentCookie, 'normal')
     const fresh = await json(await send(devicePath, currentCookie), 200, '讀取重設後新測量')
     assert.equal(fresh.onlineStatus, 'online')
-    assert.equal(fresh.latestMeasurement?.temperature, 23)
+    assert.ok(fresh.latestMeasurement?.temperature >= 18 && fresh.latestMeasurement.temperature <= 28)
     assert.equal(stack.sql("SELECT data_generation FROM measurement_runs WHERE device_id = 'north-01';"),
       (BigInt(generation) + 1n).toString())
     assert.deepEqual(browserErrors, [], '瀏覽器不得有非預期錯誤')

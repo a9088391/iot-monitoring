@@ -74,11 +74,18 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     assert.equal(updated.mode, action === 'stop' ? 'stopped' : action)
   }
 
-  await control('north-01', 'normal')
-  // 暫停週期回報，讓延遲快照期間只收到測試明確提交的變動。
-  await control('north-01', 'stop')
+  // 各次恢復正常依新採用序列變動；明示停止後讀回該輪真值，不能重用先前正常值。
+  async function normalAndStop(device) {
+    await control(device, 'normal')
+    await control(device, 'stop')
+    const current = await json(await send(`/api/devices/${device}`, hqCookie), 200, '固定該輪正常快照')
+    assert.equal(current.onlineStatus, 'online')
+    assert.ok(current.latestMeasurement.temperature >= 18 && current.latestMeasurement.temperature <= 28)
+    return current.latestMeasurement.temperature
+  }
+  let normalNorth = await normalAndStop('north-01')
   await control('south-01', 'abnormal')
-  await control('south-01', 'normal')
+  let normalSouth = await normalAndStop('south-01')
   const { items: seededAlerts } = await json(await send('/api/alerts', hqCookie), 200, '讀取南區告警')
   const southAlert = seededAlerts.find(item => item.deviceId === 'south-01' && item.type === 'temperature')
   assert.equal(southAlert?.status, 'recovered')
@@ -107,8 +114,13 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     const stale = liveStatus.filter({ hasText: /^資料待更新。$/ })
     const northDevice = page.getByRole('button', { name: /北區設備 01/ })
     const southDevice = page.getByRole('button', { name: /南區設備 01/ })
+    const northDetail = page.getByRole('region', { name: '北區設備 01', exact: true })
+    const readingText = temperature => `${Number.isInteger(temperature) ? temperature.toFixed(1) : temperature}°C`
+    const rowReading = (row, temperature) => row
+      .filter({ has: page.getByText('在線', { exact: true }) })
+      .getByText(readingText(temperature), { exact: true })
     const history = page.getByRole('button', { name: '告警歷程', exact: true })
-    const devices = page.getByRole('button', { name: '設備清單', exact: true })
+    const devices = page.getByRole('button', { name: '模擬展示', exact: true })
     const retry = page.getByRole('button', { name: '重新同步', exact: true })
     const expiredMessage = page.getByText('登入狀態已失效，請重新登入。', { exact: true })
     // 登入失敗時使用固定診斷，避免瀏覽器工具將表單值寫入日誌。
@@ -124,7 +136,11 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     }
 
     // 告警以 ID 選取，避免同設備重複異常時誤開另一筆。
-    const alertRow = item => page.getByRole('button', { name: new RegExp(`#${item.id} · 溫度異常 · ${item.deviceId}`) })
+    const alertBoard = page.getByRole('region', { name: '告警歷程', exact: true })
+    const alertDetail = page.getByRole('region', { name: /^告警 #\d+$/ })
+    const alertRow = item => alertBoard.getByRole('button')
+      .filter({ has: page.getByText(`#${item.id} 溫度異常`, { exact: true }) })
+      .filter({ has: page.getByText(item.deviceId, { exact: true }) })
     const errors = []
     let favicon404 = 0
     let restarting = false
@@ -220,30 +236,44 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     try {
       const [[older]] = await Promise.all([
         once(snapshotRead, 'ready', { signal: AbortSignal.timeout(8_000) }),
-        page.goto(stack.origin),
+        page.goto(stack.origin + '/?view=simulation'),
       ])
       assert.deepEqual(older.items.map(item => item.id), ['north-01', 'north-02', 'north-03'])
-      assert.equal(older.items[0].latestMeasurement.temperature, 23)
-      await northDevice.getByText('在線 · 23°C', { exact: true }).waitFor()
+      assert.equal(older.items[0].latestMeasurement.temperature, normalNorth)
+      await rowReading(northDevice, normalNorth).waitFor()
       await liveStatus.filter({ hasText: /^正在同步…$/ }).waitFor()
       const previousVersion = version
       assert.ok(previousVersion !== null, '延遲快照前應已收到初始版本')
-      // 服務提交異常溫度後，先確認變動已進入瀏覽器，才放行舊的 23°C 快照。
+      // 服務提交異常溫度後，先確認變動已進入瀏覽器，才放行舊的正常快照。
       const [[nextFrame]] = await Promise.all([
         once(network, 'Network.eventSourceMessageReceived', { signal: AbortSignal.timeout(8_000) }),
         control('north-01', 'abnormal'),
       ])
       assert.equal(nextFrame.eventName, 'version')
       assert.ok(BigInt(JSON.parse(nextFrame.data).version) > previousVersion)
-      assert.equal(await northDevice.getByText('在線 · 30°C', { exact: true }).count(), 0)
+      assert.equal(await rowReading(northDevice, 30).count(), 0)
     } finally {
       releaseSnapshot.resolve()
     }
-    await northDevice.getByText('在線 · 30°C', { exact: true }).waitFor()
+    await rowReading(northDevice, 30).waitFor()
     await live.waitFor()
     assert.ok(reads >= 3, '延遲快照期間的通知須觸發後續讀取')
     await page.unroute(stack.origin + listPath)
     assert.equal(await southDevice.count(), 0)
+
+    // 桌面並列清單與詳情，外部控制的下一筆真實回報須經 SSE 同步到兩區。
+    await northDevice.press('Enter')
+    await northDetail.getByText('30.0°C', { exact: true }).waitFor()
+    assert.equal(await northDevice.isVisible(), true)
+    await live.waitFor()
+    normalNorth = await normalAndStop('north-01')
+    await rowReading(northDevice, normalNorth).waitFor()
+    await northDetail.getByText(readingText(normalNorth), { exact: true }).waitFor()
+    await live.waitFor()
+    await control('north-01', 'abnormal')
+    await rowReading(northDevice, 30).waitFor()
+    await northDetail.getByText('30.0°C', { exact: true }).waitFor()
+    await live.waitFor()
 
     // 告警詳情自行從異常轉為恢復，再顯示另一個已授權操作者提交的結案。
     await history.press('Enter')
@@ -253,21 +283,25 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     await alertRow(northAlert).waitFor()
     assert.equal(await alertRow(southAlert).count(), 0)
     await alertRow(northAlert).press('Enter')
-    await page.getByText('異常持續中', { exact: true }).waitFor()
+    await alertDetail.getByText('異常持續中', { exact: true }).waitFor()
+    await alertRow(northAlert).getByText('異常持續中', { exact: true }).waitFor()
     await live.waitFor()
-    await control('north-01', 'normal')
-    await page.getByText('已恢復、待結案', { exact: true }).waitFor()
+    normalNorth = await normalAndStop('north-01')
+    await alertDetail.getByText('已恢復、待結案', { exact: true }).waitFor()
+    await alertRow(northAlert).getByText('已恢復、待結案', { exact: true }).waitFor()
     const note = '總部確認已復原'
     const closed = await json(await send(`/api/alerts/${northAlert.id}/close`, hqCookie, { result: note }, 'POST'),
       200, '總部提交結案')
     assert.equal(closed.closure.actor, 'hq')
-    await page.getByText('已結案', { exact: true }).waitFor()
-    await page.getByText(note, { exact: true }).waitFor()
+    await alertDetail.getByText('已結案', { exact: true }).waitFor()
+    await alertRow(northAlert).getByText('已結案', { exact: true }).waitFor()
+    await alertDetail.getByText(note, { exact: true }).waitFor()
     assert.equal(await page.getByLabel('處理結果', { exact: true }).count(), 0)
     assert.equal(await page.getByText('已成功結案。', { exact: true }).count(), 0)
 
     await devices.click()
-    await northDevice.getByText('在線 · 23°C', { exact: true }).waitFor()
+    await rowReading(northDevice, normalNorth).waitFor()
+    await page.getByRole('button', { name: /返回設備清單/ }).click()
     await live.waitFor()
     const beforeRestart = version
     const allowReconnect = Promise.withResolvers()
@@ -296,12 +330,12 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
         await Promise.all([disconnected.waitFor(), probeResponse])
         stack.start()
         await control('north-01', 'abnormal')
-        assert.equal(await northDevice.getByText('在線 · 23°C', { exact: true }).count(), 1)
+        assert.equal(await rowReading(northDevice, normalNorth).count(), 1)
         assert.equal(await retry.isVisible(), true)
       } finally {
         allowReconnect.resolve()
       }
-      await northDevice.getByText('在線 · 30°C', { exact: true }).waitFor()
+      await rowReading(northDevice, 30).waitFor()
       await live.waitFor()
     } finally {
       releaseProbe.resolve()
@@ -315,14 +349,22 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     const oldRead = new EventEmitter()
     const releaseLateSnapshot = Promise.withResolvers()
     const lateSnapshotSettled = Promise.withResolvers()
-    // 延遲已讀到的真實快照，讓瀏覽器在 SSE 仍連線時自己取消逾時請求。
+    const releaseFreshSnapshots = Promise.withResolvers()
+    let holdingOldSnapshot = false
+    // 舊快照保持延遲；其他種子持續通知時，後續補讀也等手動重試後才放行。
     await page.route(stack.origin + listPath, async route => {
+      if (holdingOldSnapshot) {
+        await releaseFreshSnapshots.promise
+        await route.continue()
+        return
+      }
+      holdingOldSnapshot = true
       const snapshot = await json(await send(listPath, northCookie), 200, '逾時前的真實快照')
       oldRead.emit('ready', snapshot)
       await releaseLateSnapshot.promise
       await route.fulfill({ json: snapshot })
       lateSnapshotSettled.resolve()
-    }, { times: 1 })
+    })
     try {
       const [[older]] = await Promise.all([
         once(oldRead, 'ready', { signal: AbortSignal.timeout(8_000) }),
@@ -334,21 +376,24 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
         stale.waitFor(),
       ])
       assert.equal(aborted.failure()?.errorText, 'net::ERR_ABORTED')
-      assert.equal(await northDevice.getByText('在線 · 30°C', { exact: true }).count(), 1)
+      assert.equal(await rowReading(northDevice, 30).count(), 1)
       await page.setViewportSize({ width: 390, height: 844 })
       assert.deepEqual(await page.evaluate(() => [innerWidth, innerHeight, document.documentElement.scrollWidth]),
         [390, 844, 390])
-      await control('north-01', 'normal')
-      await control('north-01', 'stop')
+      normalNorth = await normalAndStop('north-01')
       await retry.press('Enter')
-      await northDevice.getByText('在線 · 23°C', { exact: true }).waitFor()
+      await liveStatus.filter({ hasText: /^正在同步…$/ }).waitFor()
+      releaseFreshSnapshots.resolve()
+      await rowReading(northDevice, normalNorth).waitFor()
       await live.waitFor()
     } finally {
+      releaseFreshSnapshots.resolve()
       releaseLateSnapshot.resolve()
     }
     await lateSnapshotSettled.promise
+    await page.unroute(stack.origin + listPath)
     // 舊快照在新快照完成後才放行，畫面不得退回舊溫度。
-    await northDevice.getByText('在線 · 23°C', { exact: true }).waitFor()
+    await rowReading(northDevice, normalNorth).waitFor()
     await live.waitFor()
     assert.equal(await retry.count(), 0)
 
@@ -380,6 +425,8 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     revoked = false
 
     await signIn('north')
+    await northDetail.locator('.temperature-value').waitFor()
+    await page.getByRole('button', { name: /返回設備清單/ }).click()
     await northDevice.waitFor()
     await live.waitFor()
     // 同一 Cookie jar 真實換發時，記錄舊頁是否曾短暫顯示新身分的設備。
@@ -425,7 +472,7 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     rotating = false
 
     // 重新登入後，須從新身分建立串流和範圍，不能沿用北區快照。
-    await control('south-01', 'normal')
+    normalSouth = await normalAndStop('south-01')
     let southCookie
     // 在首次訂閱前，只縮短這次南區登入的絕對期限，讓兩端使用同一個真實期限。
     await page.route(stack.origin + eventPath, async route => {
@@ -438,10 +485,12 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
       await route.continue()
     }, { times: 1 })
     await signIn('south')
-    await southDevice.getByText('在線 · 23°C', { exact: true }).waitFor()
+    await page.getByRole('region', { name: '南區設備 01', exact: true }).waitFor()
+    await page.getByRole('button', { name: /返回設備清單/ }).click()
+    await rowReading(southDevice, normalSouth).waitFor()
     await live.waitFor()
     assert.equal(await northDevice.count(), 0)
-    assert.equal(await page.getByRole('listitem').count(), 3)
+    assert.equal(await page.locator('.device-list > li').count(), 3)
     await history.press('Enter')
     await alertRow(southAlert).waitFor()
     await live.waitFor()
@@ -454,7 +503,7 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
     await expiredMessage.waitFor({ timeout: 12_000 })
     assert.equal((await send(sessionPath, southCookie)).status, 401)
     assert.equal(await alertRow(southAlert).count(), 0)
-    assert.equal(await page.getByRole('listitem').count(), 0)
+    assert.equal(await page.locator('.device-list > li').count(), 0)
     assert.equal(await history.count(), 0)
     assert.equal(await liveStatus.count(), 0)
 
@@ -482,15 +531,17 @@ test('IoT 票 06：瀏覽器即時快照、斷線重連與身分隔離', { timeo
       ])
       assert.equal(unavailableStream.status(), 503)
       assert.deepEqual(await unavailableStream.json(), { error: 'service_unavailable' })
+      await page.getByRole('region', { name: '南區設備 01', exact: true }).waitFor()
+      await page.getByRole('button', { name: /返回設備清單/ }).click()
       await southDevice.waitFor()
       await disconnected.waitFor()
       assert.equal(await northDevice.count(), 0)
-      assert.equal(await page.getByRole('listitem').count(), 3)
+      assert.equal(await page.locator('.device-list > li').count(), 3)
       assert.ok(Date.now() < southExpiresAt, '授權清單須在到期前由 HTTP 身分恢復')
       await expiredMessage.waitFor({ timeout: 8_000 })
       assert.equal(frames, framesBeforeRestore, '整次登入不得收到任何串流訊框')
       assert.equal((await send(sessionPath, restoredCookie)).status, 401)
-      assert.equal(await page.getByRole('listitem').count(), 0)
+      assert.equal(await page.locator('.device-list > li').count(), 0)
       assert.equal(await history.count(), 0)
       assert.equal(await liveStatus.count(), 0)
     } finally {

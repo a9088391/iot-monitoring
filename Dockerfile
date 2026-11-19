@@ -14,6 +14,12 @@ RUN go mod download
 COPY backend/ ./
 RUN CGO_ENABLED=0 go build -trimpath -o /out/iot .
 
+# race 檢查只在專用建置目標加入 C 工具鏈，正式映像仍使用原本的靜態執行檔。
+FROM backend AS backend-test
+RUN apk add --no-cache gcc musl-dev
+RUN CGO_ENABLED=1 go test -race -c -o /out/measurements.test . \
+    && CGO_ENABLED=1 go build -race -trimpath -o /out/reset-app .
+
 # 執行階段只帶入 Go 執行檔與前端產物，讓兩者由同一個服務提供。
 FROM alpine:3.24.0@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acaeb241c829f4
 WORKDIR /app

@@ -308,6 +308,29 @@ func TestResetRestart(t *testing.T) {
 	if page.Total != 1 || page.Items[0].ID == before.AlertID {
 		t.Fatal("fresh sample failed to create a new alert without reusing the previous identity")
 	}
+	// 重設後的正常啟動仍自動回報六台，但不可輪替資料世代或重新接納舊登入。
+	app.simulator.close()
+	if err := stopSimulationsOnStartup(t.Context(), target.conn); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.scanOffline(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+	app.simulator = newSimulator(t.Context(), app.SubmitMeasurement)
+	t.Cleanup(app.simulator.close)
+	if err := app.startDemoSimulations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	app.simulator.close()
+	var reporting int
+	if err := target.conn.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM measurement_runs r JOIN latest_measurements m USING (device_id)
+		WHERE r.data_generation = 2 AND m.temperature BETWEEN 18 AND 28
+	`).Scan(&reporting); err != nil || reporting != 6 {
+		t.Fatalf("reset restart did not automatically report all devices in generation 2: count=%d err=%v", reporting, err)
+	}
+	requireResetCheck(t, target.clusterID+":2")
+	f.request(t, http.MethodGet, "/api/session", "", &before.Cookie, http.StatusUnauthorized)
 }
 
 // testResetCredentials 破壞夾具的保護權限或憑證內容，驗證預檢及套用都拒絕。

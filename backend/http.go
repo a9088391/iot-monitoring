@@ -38,6 +38,7 @@ type application struct {
 	arrivals       pendingMeasurements
 	simulator      *simulator
 	events         liveEvents
+	taichung       taichungService
 }
 
 // router 組裝本機網站與 API，讓共同的 Host 檢查及 API 寫入保護先於各端點執行。
@@ -77,6 +78,7 @@ func (a *application) router() http.Handler {
 	api.POST("/login", a.login)
 	api.POST("/logout", a.logout)
 	api.GET("/session", a.session)
+	api.GET("/taichung/sensors", a.taichungSensors)
 	api.GET("/events", a.eventVersions)
 	api.GET("/devices", a.devices)
 	api.GET("/devices/:id", a.device)

@@ -65,29 +65,48 @@ test('畫面判分拒絕同頁越權與錯誤設備狀態', () => {
   const item = plannedSample(1201)
   const rows = new Map([[1201, { ...item, outcome: 'adopted', entryNs: '1000000000' }]])
   const frames = new Map([['site', [
-    { type: 'row', parts: ['south-002', '南區場域', '在線 · 20.01302°C'], atNs: '1100000000', visible: true },
-    { type: 'row', parts: ['north-002', '北區場域', '離線 · 20.01302°C（資料已非即時）'], atNs: '1100000000', visible: true },
-    { type: 'row', parts: ['north-002', '北區場域', '在線 · 20.01302°C'], atNs: '1100000000', visible: true },
+    { type: 'row', parts: ['south-002', '南區場域', '在線', '20.01302°C'], atNs: '1100000000', visible: true },
+    { type: 'row', parts: ['north-002', '北區場域', '離線', '20.01302°C資料已非即時'], atNs: '1100000000', visible: true },
+    { type: 'row', parts: ['north-002', '北區場域', '在線', '20.0°C'], atNs: '1100000000', visible: true },
+    { type: 'row', parts: ['north-002', '北區場域', '在線', '20.01302°C'], atNs: '1100000000', visible: true },
   ]]])
   const result = verifyDisplays([watcher], frames, { rows, plan: [item] }, source,
     new Map([['site', { low: 0n, high: 20n }]]))
   assert.equal(result.assessments[0].status, 'PASS')
-  assert.deepEqual(result.failures.map(failure => failure.kind), ['unexpected-device-scope', 'unexpected-device-state'])
+  assert.deepEqual(result.failures.map(failure => failure.kind), [
+    'unexpected-device-scope', 'unexpected-device-state', 'unexpected-device-state',
+  ])
 })
 
-// Vue 的離線附註是獨立節點，正規化後的 DOM 在溫度與附註之間仍保留一個空格。
+// 在線與溫度分欄；離線附註仍須連同原始精度一起核對。
 test('畫面判分辨識實際 DOM 的離線溫度與附註', () => {
   const watcher = { id: 'north', role: 'north', view: 'devices', devices: ['north-001'] }
   const item = plannedSample(7100)
   const rows = new Map([[item.slot, { ...item, outcome: 'adopted', entryNs: '1000000000' }]])
   const frames = new Map([['north', [
-    { type: 'row', parts: ['north-001', '北區場域', '在線 · 20.07201°C'], atNs: '1100000000', visible: true },
-    { type: 'row', parts: ['north-001', '北區場域', '離線 · 20.07201°C （資料已非即時）'], atNs: '16300000000', visible: true },
+    { type: 'row', parts: ['north-001', '北區場域', '在線', '20.07201°C'], atNs: '1100000000', visible: true },
+    { type: 'row', parts: ['north-001', '北區場域', '離線', '20.07201°C資料已非即時'], atNs: '16300000000', visible: true },
   ]]])
   const result = verifyDisplays([watcher], frames, { rows, plan: [item] }, source, browser)
   const offline = result.assessments.find(assessment => assessment.kind === 'offline-device')
   assert.equal(offline.status, 'PASS')
   assert.equal(offline.delayHighNs, '300000020')
+  assert.deepEqual(result.failures, [])
+})
+
+// 分欄後仍以同一告警編號與精確設備對應恢復，不將相鄰欄位拼成虛構畫面文字。
+test('畫面判分辨識告警分欄的同筆恢復', () => {
+  const watcher = { id: 'north', role: 'north', view: 'alerts', devices: ['north-001'] }
+  const rows = new Map([
+    [1500, { outcome: 'adopted', entryNs: '1000000000' }],
+    [1700, { outcome: 'adopted', entryNs: '2000000000' }],
+  ])
+  const frames = new Map([['north', [
+    { type: 'row', parts: ['#7 溫度異常', 'north-001', '異常持續中'], atNs: '1100000000', visible: true },
+    { type: 'row', parts: ['#7 溫度異常', 'north-001', '已恢復、待結案'], atNs: '2100000000', visible: true },
+  ]]])
+  const result = verifyDisplays([watcher], frames, { rows, plan: [] }, source, browser)
+  assert.deepEqual(result.assessments.slice(0, 2).map(item => item.status), ['PASS', 'PASS'])
   assert.deepEqual(result.failures, [])
 })
 

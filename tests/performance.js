@@ -219,7 +219,7 @@ async function run(probe) {
       const row = [...document.querySelectorAll('.device-button')]
         .find(button => button.firstElementChild.textContent === id)
       const top = row.getBoundingClientRect().top
-      return { top, innerHeight, status: row.lastElementChild.textContent.trim() }
+      return { top, innerHeight, status: row.querySelector('.status').textContent.trim() }
     }, device))
     assert.ok(offscreen.top >= offscreen.innerHeight && offscreen.status === '尚未回報', '探查末列須在原生視口外且尚未回報')
     hiddenPhase = 'hiding'
@@ -236,11 +236,20 @@ async function run(probe) {
         body: JSON.stringify({ action: 'normal', version }),
       })
       if (!control.ok) return { status: control.status }
+      // 正常值每五秒變動，只停止此探查設備，固定這次可視恢復要核對的真實樣本。
+      const normal = await control.json()
+      const stopped = await fetch(path + '/simulation', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Protection': '1' },
+        body: JSON.stringify({ action: 'stop', version: normal.version }),
+      })
+      if (!stopped.ok) return { status: stopped.status }
       const current = await fetch(path)
       if (!current.ok) return { status: current.status }
       return { status: 200, temperature: (await current.json()).latestMeasurement?.temperature }
     }, device))
-    assert.deepEqual(result, { status: 200, temperature: 23 }, '隱藏期間須確實提交末列的新溫度')
+    assert.equal(result.status, 200, '隱藏期間須確實提交末列的新溫度')
+    assert.ok(result.temperature >= 18 && result.temperature <= 28)
+    const probeTemperature = `${Number.isInteger(result.temperature) ? result.temperature.toFixed(1) : result.temperature}°C`
     assert.equal(await doubleFrame(resumedWatcher.page), 'timeout', '原生隱藏期間不得完成雙 rAF')
     await drainWindows(true)
 
@@ -264,7 +273,7 @@ async function run(probe) {
             row.type !== 'row'
             || row.visible !== true
             || nanos(row.atNs) < resumeAt
-            || (row.key === device && row.parts[2] !== '在線 · 23°C')
+            || (row.key === device && (row.parts[2] !== '在線' || row.parts[3] !== probeTemperature))
           ) continue
           if (!painted.has(row.key)) painted.set(row.key, row)
         }

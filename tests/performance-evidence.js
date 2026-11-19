@@ -2,9 +2,9 @@ import { assessDisplays, formalEnd, intervalNs, nanos, plannedSample, totalSlots
 
 const offlineNs = 15_000_000_000n
 const sites = { north: '北區場域', south: '南區場域' }
-const temp = /^在線 · (\d+(?:\.\d+)?)°C$/
-const offline = /^離線 · (\d+(?:\.\d+)?)°C ?（資料已非即時）$/
-const alert = /^#(\d+) · (溫度異常|離線) · ((north|south)-\d{3})$/
+const temp = /^(\d+(?:\.\d+)?)°C$/
+const offline = /^(\d+(?:\.\d+)?)°C ?資料已非即時$/
+const alert = /^#(\d+) (溫度異常|離線)$/
 
 // 入口時間缺少或無效時不能推算離線期限，讓該筆保留無時基或缺漏結果。
 function offlineDeadline(entryNs) {
@@ -142,13 +142,13 @@ export function verifyDisplays(watchers, frames, generator, sourceClock, browser
         continue
       }
       if (watcher.view === 'alerts') {
-        const [label, state] = row.parts
+        const [label, device, state] = row.parts
         const parts = alert.exec(label)
-        if (!parts || !scope.has(parts[3])) {
+        if (!parts || !scope.has(device)) {
           wrong('unexpected-alert-scope')
           continue
         }
-        const [, id, name, device] = parts
+        const [, id, name] = parts
         const kind = name === '離線' ? 'offline-alert' : 'temperature-alert'
         const next = indices.get(kind) ?? 0
         const planned = alertExpected.filter(sample => sample.kind === kind)[next]
@@ -158,7 +158,7 @@ export function verifyDisplays(watchers, frames, generator, sourceClock, browser
           !planned
           || planned.device !== device
           || planned.state !== state
-          || row.parts.length !== 2
+          || row.parts.length !== 3
           || (original === undefined ? [...alertIds.values()].includes(id) : original !== id)
         ) {
           wrong('unexpected-alert-state')
@@ -170,9 +170,9 @@ export function verifyDisplays(watchers, frames, generator, sourceClock, browser
         continue
       }
 
-      const [device, site, state] = row.parts
+      const [device, site, state, temperature] = row.parts
       if (
-        row.parts.length !== 3
+        row.parts.length !== 4
         || !scope.has(device)
         || site !== sites[device.split('-')[0]]
       ) {
@@ -180,9 +180,9 @@ export function verifyDisplays(watchers, frames, generator, sourceClock, browser
         continue
       }
       const previous = temperatures.get(device)
-      if (state === '尚未回報' && !previous) continue
-      const isOffline = offline.exec(state)
-      const degrees = temp.exec(state) ?? isOffline
+      if (state === '尚未回報' && temperature === '—' && !previous) continue
+      const isOffline = state === '離線' ? offline.exec(temperature) : null
+      const degrees = state === '在線' ? temp.exec(temperature) : isOffline
       const sample = degrees ? byValue.get(Math.round(Number(degrees[1]) * 100_000)) : undefined
       const adopted = sample ? rowFor(sample.slot) : undefined
       if (

@@ -132,7 +132,7 @@ func TestOfflineIntegration(t *testing.T) {
 		recovery := deadline.Add(2 * time.Second)
 		f.setTime(recovery)
 		controlSimulation(t, f.measurementFixture, "north-01", "normal", "2", simulationState{"normal", "3", true})
-		report := expectSimulationSample(t, observed, "north-01", 23, true)
+		report := expectSimulationSample(t, observed, "north-01", normalSimulationSample, true)
 		expectDeviceOnlineStatus(t, f, "north-01", "online", &report)
 		recovered := offlineAlerts(t, f, "north-01", 1)[0]
 		expectOfflineAlert(t, recovered, deadline, detected, &recovery, false)
@@ -291,7 +291,7 @@ func TestOfflineIntegration(t *testing.T) {
 		at := started.Add(120 * time.Second)
 		f.setTime(at)
 		controlSimulation(t, f.measurementFixture, "south-02", "normal", "0", simulationState{"normal", "1", true})
-		initial := expectSimulationSample(t, observed, "south-02", 23, true)
+		initial := expectSimulationSample(t, observed, "south-02", normalSimulationSample, true)
 		// 以設備控制列的鎖讓停止請求先進入資料庫但暫時無法提交。
 		rowLock, err := target.pool.BeginTx(t.Context(), nil)
 		if err != nil {

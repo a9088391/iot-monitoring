@@ -187,7 +187,7 @@ export async function openWatchers(profileRoot, origin, passwords, pages, owned,
       if (status < 400 || (pathname === '/favicon.ico' && status === 404)) return
       opened.errors.push({ type: 'response', pathname, status })
     })
-    await bounded(() => page.goto(origin))
+    await bounded(() => page.goto(origin + '/?view=simulation'))
     try {
       await bounded(() => page.getByLabel('帳號', { exact: true }).fill(watcher.role))
       const password = page.getByLabel('密碼', { exact: true })
@@ -198,16 +198,23 @@ export async function openWatchers(profileRoot, origin, passwords, pages, owned,
       if (error.code === 'BROWSER_OBSERVATION_TIMEOUT') throw error
       throw new Error(`${watcher.id} 的登入操作失敗`)
     }
-    await bounded(() => page.getByRole('heading', { name: '設備清單', level: 2, exact: true }).waitFor())
+    await bounded(() => page.getByRole('heading', { name: '設備清單', level: 1, exact: true }).waitFor())
     const cookies = await bounded(() => context.cookies(origin))
     const token = cookies.find(cookie => cookie.name === 'iot_session')?.value
     assert.ok(token && !tokens.has(token), '十個觀看工作階段須有相異登入')
     tokens.add(token)
+    // 窄視窗預選詳情後須明確返回，才能以原生清單列取得效能證據。
+    await bounded(() => page.locator('.detail-pane .device-details').waitFor())
+    await bounded(() => page.getByRole('button', { name: /返回設備清單/ }).click())
     if (watcher.view === 'alerts') {
       await bounded(() => page.getByRole('button', { name: '告警歷程', exact: true }).click())
       await bounded(() => page.getByText('目前沒有可查看的告警。', { exact: true }).waitFor())
     } else {
-      if (watcher.page === 1) await bounded(() => page.getByRole('button', { name: '下一頁', exact: true }).click())
+      if (watcher.page === 1) {
+        await bounded(() => page.getByRole('button', { name: '下一頁', exact: true }).click())
+        await bounded(() => page.locator('.detail-pane .device-details').waitFor())
+        await bounded(() => page.getByRole('button', { name: /返回設備清單/ }).click())
+      }
       await bounded(() => page.getByRole('button', { name: new RegExp(`^${watcher.devices[0]} `) }).waitFor())
       const actual = await bounded(() => page.locator('.device-button:not(.alert-button) > span:first-child').allTextContents())
       assert.deepEqual(actual, watcher.devices, '起始設備頁的識別或可見範圍不符')
@@ -278,7 +285,7 @@ function installRecorder(view) {
     const seen = new Set()
     for (const button of document.querySelectorAll(selector)) {
       const parts = partsOf(button)
-      const key = view === 'devices' ? parts[0] : parts[0]?.split(' · ')[0]
+      const key = view === 'devices' ? parts[0] : parts[0]?.split(' ')[0]
       const state = JSON.stringify(parts)
       if (seen.has(key)) record({ type: 'duplicate', key, parts, atNs })
       seen.add(key)

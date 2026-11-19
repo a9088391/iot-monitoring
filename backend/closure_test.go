@@ -47,7 +47,7 @@ func TestClosureIntegration(t *testing.T) {
 	recovery := at.Add(time.Second)
 	legacy.setTime(recovery)
 	controlSimulation(t, legacy.measurementFixture, northDevice, "normal", "1", simulationState{"normal", "2", true})
-	expectSimulationSample(t, observed, northDevice, 23, true)
+	expectSimulationSample(t, observed, northDevice, normalSimulationSample, true)
 	controlSimulation(t, legacy.measurementFixture, northDevice, "stop", "2", simulationState{"stopped", "3", true})
 	legacy.server.Close()
 	legacy.app.simulator.close()
@@ -139,14 +139,14 @@ func TestClosureIntegration(t *testing.T) {
 	// 以真正的掃描及回報建立離線恢復，重現超標回報恢復在線但溫度告警仍活動。
 	f.setTime(at.Add(3 * time.Second))
 	controlSimulation(t, f.measurementFixture, southDevice, "normal", "0", simulationState{"normal", "1", true})
-	expectSimulationSample(t, observed, southDevice, 23, true)
+	expectSimulationSample(t, observed, southDevice, normalSimulationSample, true)
 	controlSimulation(t, f.measurementFixture, southDevice, "stop", "1", simulationState{"stopped", "2", true})
 
 	// 第三台設備在前一輪巡檢仍在線，期限到 +20 秒，只有競爭中的下一輪才會新增離線告警。
 	const overdueDevice = "north-02"
 	f.setTime(at.Add(5 * time.Second))
 	controlSimulation(t, f.measurementFixture, overdueDevice, "normal", "0", simulationState{"normal", "1", true})
-	last := expectSimulationSample(t, observed, overdueDevice, 23, true)
+	last := expectSimulationSample(t, observed, overdueDevice, normalSimulationSample, true)
 	controlSimulation(t, f.measurementFixture, overdueDevice, "stop", "1", simulationState{"stopped", "2", true})
 	f.scan(t, at.Add(19*time.Second))
 	offlineAlerts(t, f, overdueDevice, 0)

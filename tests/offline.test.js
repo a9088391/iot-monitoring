@@ -101,9 +101,10 @@ function safeDiagnostic(value, secrets) {
 }
 
 // 分開驗證回報期限、實際發現時間及補判標記，避免混用三者。
-function assertOfflineDeadline(alert, baselineNs, atRestart) {
-  assert.equal(alert.status, 'active', '離線告警應持續中')
-  assert.equal(alert.recoveredAt, null, '離線告警尚未恢復')
+function assertOfflineDeadline(alert, baselineNs, atRestart, status = 'active') {
+  assert.equal(alert.status, status, '離線告警應符合是否已收到新回報')
+  if (status === 'active') assert.equal(alert.recoveredAt, null, '離線告警尚未恢復')
+  else assert.ok(timestampNs(alert.recoveredAt) >= timestampNs(alert.detectedAt), '新首報恢復須晚於補判')
   assert.equal(alert.detectedAtRestart, atRestart, '離線告警須標記實際發現方式')
   // 用原始 UTC 時間換算奈秒，確保比較可區分恰好 15 秒與超過期限。
   const deadline = timestampNs(alert.deadlineAt)
@@ -196,12 +197,13 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     })
     // 未攔截的頁面例外也經同一遮蔽流程收集，供測試結尾統一驗證。
     page.on('pageerror', error => consoleErrors.push(safeDiagnostic(`${error.name}: ${error.message}`, diagnosticSecrets)))
-    // 先確認詳情顯示尚未回報，避免用已有測量的畫面當初始條件。
-    await page.goto(stack.origin, { timeout: 10_000 })
-    await page.getByRole('heading', { name: '設備清單', level: 2, exact: true }).waitFor()
+    // 六台種子已在瀏覽器啟動前採用正常首報。
+    await page.goto(stack.origin + '/?view=simulation', { timeout: 10_000 })
+    await page.getByRole('heading', { name: '設備清單', level: 1, exact: true }).waitFor()
     await page.getByRole('button', { name: /北區設備 01/ }).click()
-    await page.getByText('north-01', { exact: true }).waitFor()
-    await page.getByText('尚未回報', { exact: true }).waitFor()
+    const detail = page.getByRole('region', { name: '北區設備 01', exact: true })
+    await detail.getByText('north-01 · 北區場域', { exact: true }).waitFor()
+    await detail.getByText('在線', { exact: true }).waitFor()
     const liveStatus = page.locator('#live-status')
     const live = liveStatus.filter({ hasText: '即時更新中' })
     await live.waitFor()
@@ -227,8 +229,8 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     // 先確認設備未曾回報，再以異常操作建立有效測量及獨立溫度告警。
     const initialDevice = await device(stack, hqCookie, 'north-01')
     const initialSimulation = await simulation(stack, hqCookie, 'north-01')
-    assert.equal(initialDevice.onlineStatus, 'unreported', '新設備尚未開始回報')
-    assert.equal(initialSimulation.mode, 'stopped', '新設備模擬須保持停止')
+    assert.equal(initialDevice.onlineStatus, 'online', '種子設備須已自動回報')
+    assert.equal(initialSimulation.mode, 'normal', '種子設備須自動正常回報')
     const started = await control(stack, hqCookie, 'north-01', 'abnormal')
     assert.equal(started.mode, 'abnormal', '正常服務須接受總部異常回報控制')
     const firstOnline = await device(stack, hqCookie, 'north-01')
@@ -239,8 +241,8 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     assert.equal(temperatureBefore.temperature, 30, '溫度告警須保留原始異常值')
 
     // 不操作畫面也須顯示已提交的測量，再由手動刷新核對回應與時間。
-    await page.getByText('在線', { exact: true }).waitFor()
-    await page.getByText('30°C', { exact: true }).waitFor()
+    await detail.getByText('在線', { exact: true }).waitFor()
+    await detail.getByText('30.0°C', { exact: true }).waitFor()
     await live.waitFor()
     const refreshButton = page.getByRole('button', { name: '重新載入設備狀態', exact: true })
     const firstRefresh = page.waitForResponse(response =>
@@ -251,9 +253,9 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     const firstDisplayedDevice = await firstRefreshResponse.json()
     assert.equal(firstDisplayedDevice.onlineStatus, 'online', '畫面須顯示目前在線狀態')
     assert.equal(firstDisplayedDevice.latestMeasurement?.temperature, 30, '畫面須顯示最新異常溫度')
-    await page.getByText('在線', { exact: true }).waitFor()
-    await page.getByText('30°C', { exact: true }).waitFor()
-    const firstDisplayedReceipt = await page.locator('time[datetime]').getAttribute('datetime')
+    await detail.getByText('在線', { exact: true }).waitFor()
+    await detail.getByText('30.0°C', { exact: true }).waitFor()
+    const firstDisplayedReceipt = await detail.locator('time[datetime]').getAttribute('datetime')
     assert.equal(firstDisplayedReceipt, firstDisplayedDevice.latestMeasurement.receivedAt,
       '畫面時間屬性須保留 API 的原始回報時間')
 
@@ -275,10 +277,10 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     assert.deepEqual(temperatureDuringOffline, temperatureBefore, '離線不能覆蓋或恢復獨立的溫度告警')
 
     // 背景檢查提交離線後，瀏覽器自動顯示離線並保留原溫度與回報時間。
-    await page.getByText('離線', { exact: true }).waitFor()
-    await page.getByText('資料已非即時', { exact: true }).waitFor()
-    await page.getByText('30°C', { exact: true }).waitFor()
-    assert.equal(await page.locator('time[datetime]').getAttribute('datetime'), lastReceipt,
+    await detail.getByText('離線', { exact: true }).waitFor()
+    await detail.getByText('資料已非即時', { exact: true }).waitFor()
+    await detail.getByText('30.0°C', { exact: true }).waitFor()
+    assert.equal(await detail.locator('time[datetime]').getAttribute('datetime'), lastReceipt,
       '離線畫面仍顯示最後有效回報時間')
 
     // 第二台先收到有效回報再停止，建立能在停機期間到期的基準。
@@ -290,15 +292,16 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     assert.equal(secondBeforeRestart.onlineStatus, 'online', '重啟前第二台設備須有有效回報')
     assert.equal(secondBeforeRestart.latestMeasurement?.temperature, 30, '重啟前第二台設備須保留 30°C')
 
-    // 只在隔離資料庫阻擋第三台的測量寫入，保留正式控制入口建立的首筆期待起點。
-    stack.sql("ALTER TABLE latest_measurements ADD CONSTRAINT test_first_report_failure CHECK (device_id <> 'north-03');")
-    const thirdStarted = await control(stack, hqCookie, 'north-03', 'normal')
+    // 額外非種子設備尚無首報；只阻擋它的寫入，重啟不會自動替此夾具啟動。
+    stack.sql("INSERT INTO devices(id,name,site_id) VALUES ('north-04','首報故障夾具','north');")
+    stack.sql("ALTER TABLE latest_measurements ADD CONSTRAINT test_first_report_failure CHECK (device_id <> 'north-04');")
+    const thirdStarted = await control(stack, hqCookie, 'north-04', 'normal')
     assert.equal(thirdStarted.mode, 'normal', '重啟前第三台設備須已開始模擬')
-    const thirdBeforeRestart = await device(stack, hqCookie, 'north-03')
+    const thirdBeforeRestart = await device(stack, hqCookie, 'north-04')
     assert.equal(thirdBeforeRestart.onlineStatus, 'awaiting', '重啟前第三台設備須仍等待首筆回報')
     assert.equal(thirdBeforeRestart.latestMeasurement, undefined, '第三台設備的首筆回報尚未成功寫入')
     // 直接讀取已持久化的首筆期待奈秒值，供重啟前後逐值比對。
-    const readFirstExpected = () => stack.sql("SELECT first_expected_at_ns FROM device_simulations WHERE device_id = 'north-03';")
+    const readFirstExpected = () => stack.sql("SELECT first_expected_at_ns FROM device_simulations WHERE device_id = 'north-04';")
     const firstExpectedBeforeRestart = readFirstExpected()
     assert.match(firstExpectedBeforeRestart, /^[1-9]\d*$/, '首筆期待起點須已持久保存為整數奈秒')
 
@@ -318,42 +321,45 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
       northOneSimulation, northTwoSimulation, northThreeSimulation, alertsAfterRestart] = await Promise.all([
       device(stack, hqCookie, 'north-01'),
       device(stack, hqCookie, 'north-02'),
-      device(stack, hqCookie, 'north-03'),
+      device(stack, hqCookie, 'north-04'),
       simulation(stack, hqCookie, 'north-01'),
       simulation(stack, hqCookie, 'north-02'),
-      simulation(stack, hqCookie, 'north-03'),
+      simulation(stack, hqCookie, 'north-04'),
       alerts(stack, hqCookie),
     ])
-    assert.equal(northOneAfterRestart.onlineStatus, 'offline', '既有離線狀態須跨服務重啟保存')
-    assert.equal(northTwoAfterRestart.onlineStatus, 'offline', '服務停止期間超時的設備須在啟動時離線')
+    assert.equal(northOneAfterRestart.onlineStatus, 'online', '種子新首報須在補判後恢復在線')
+    assert.equal(northTwoAfterRestart.onlineStatus, 'online', '停機逾時須先留補判再由種子首報恢復')
     assert.equal(northThreeAfterRestart.onlineStatus, 'offline', '停機時超過首筆期待期限的設備須在啟動時離線')
     assert.equal(northThreeAfterRestart.latestMeasurement, undefined, '啟動補判不可為第三台設備補造測量')
     assert.equal(readFirstExpected(), firstExpectedBeforeRestart, '重啟須保存原首筆期待起點')
-    assert.deepEqual(measurementSnapshot(northOneAfterRestart.latestMeasurement), measurementSnapshot(liveOffline.item.latestMeasurement),
-      '重啟須保留既有離線設備的原始測量')
-    assert.deepEqual(measurementSnapshot(northTwoAfterRestart.latestMeasurement), measurementSnapshot(secondBeforeRestart.latestMeasurement),
-      '啟動補判須保留第二台設備最後有效測量')
-    // 三種情境都須停止模擬並撤銷舊執行的重送資格。
-    assert.deepEqual([northOneSimulation.mode, northOneSimulation.canReplay], ['stopped', false],
-      '重啟後既有模擬須停止且舊執行不可重送')
-    assert.deepEqual([northTwoSimulation.mode, northTwoSimulation.canReplay], ['stopped', false],
-      '重啟後新離線設備的模擬須停止且舊執行不可重送')
+    for (const item of [northOneAfterRestart, northTwoAfterRestart]) {
+      assert.ok(item.latestMeasurement.temperature >= 18 && item.latestMeasurement.temperature <= 28)
+      assert.ok(timestampNs(item.latestMeasurement.receivedAt) > timestampNs(secondBeforeRestart.latestMeasurement.receivedAt))
+    }
+    assert.deepEqual([northOneSimulation.mode, northOneSimulation.canReplay], ['normal', true])
+    assert.deepEqual([northTwoSimulation.mode, northTwoSimulation.canReplay], ['normal', true])
     assert.deepEqual([northThreeSimulation.mode, northThreeSimulation.canReplay], ['stopped', false],
-      '重啟須停止第三台設備原本仍執行中的模擬')
+      '非種子故障夾具重啟仍須撤銷舊執行，不補造首報')
 
     // 原有告警須原樣保留，另兩台依各自基準建立標為重啟補判的告警。
     const northOneOfflineAfterRestart = oneAlert(alertsAfterRestart, 'north-01', 'offline')
-    assert.deepEqual(northOneOfflineAfterRestart, liveOffline.alert, '既有離線告警 ID 與補判標記須原樣保留')
+    assert.equal(northOneOfflineAfterRestart.status, 'recovered')
+    assert.ok(northOneOfflineAfterRestart.recoveredAt)
+    assert.deepEqual({ ...northOneOfflineAfterRestart, status: 'active', recoveredAt: null }, liveOffline.alert,
+      '新首報只能標記恢復，原 ID、期限與發現方式不可改寫')
     const northTwoOfflineAfterRestart = oneAlert(alertsAfterRestart, 'north-02', 'offline')
-    assertOfflineDeadline(northTwoOfflineAfterRestart, timestampNs(secondBeforeRestart.latestMeasurement.receivedAt), true)
-    const northThreeOfflineAfterRestart = oneAlert(alertsAfterRestart, 'north-03', 'offline')
+    assertOfflineDeadline(northTwoOfflineAfterRestart, timestampNs(secondBeforeRestart.latestMeasurement.receivedAt), true, 'recovered')
+    const northThreeOfflineAfterRestart = oneAlert(alertsAfterRestart, 'north-04', 'offline')
     assertOfflineDeadline(northThreeOfflineAfterRestart, BigInt(firstExpectedBeforeRestart), true)
     // 完成補判驗證後移除測量失敗條件，再確認既有溫度告警仍在。
     stack.sql('ALTER TABLE latest_measurements DROP CONSTRAINT test_first_report_failure;')
     const temperatureAfterRestart = oneAlert(alertsAfterRestart, 'north-01', 'temperature')
-    assert.deepEqual(temperatureAfterRestart, temperatureBefore, '服務重啟不得清除仍持續的溫度告警')
+    assert.equal(temperatureAfterRestart.status, 'recovered')
+    assert.ok(temperatureAfterRestart.recoveredAt)
+    assert.deepEqual({ ...temperatureAfterRestart, status: 'active', recoveredAt: null }, temperatureBefore,
+      '自動正常首報只恢復舊溫度告警，不能刪除或結案')
 
-    // 以最新控制版本開始新一輪異常回報，驗證在線恢復和溫度異常可同時存在。
+    // 以最新版本再產生異常，舊恢復紀錄不倒退，新溫度告警獨立建立。
     const recoveredRun = await control(stack, hqCookie, 'north-01', 'abnormal')
     assert.equal(recoveredRun.mode, 'abnormal', '重啟後可用目前控制版本開始新的異常回報')
     const recoveredDevice = await device(stack, hqCookie, 'north-01')
@@ -370,15 +376,17 @@ test('IoT 票 04：離線狀態、重啟補判與回報恢復', { timeout: 600_0
     assert.ok(recoveredOffline.recoveredAt, '離線恢復須保存恢復時間')
     assert.equal(recoveredOffline.detectedAtRestart, false, '恢復不得改寫原本即時發現標記')
     assert.equal(recoveredOffline.deadlineAt, liveOffline.alert.deadlineAt, '恢復不得改寫原回報期限')
-    assert.deepEqual(oneAlert(recoveredAlerts, 'north-01', 'temperature'), temperatureBefore,
-      '異常回報恢復在線時，溫度告警仍持續中')
+    const temperatureEpisodes = recoveredAlerts.filter(item => item.deviceId === 'north-01' && item.type === 'temperature')
+    assert.equal(temperatureEpisodes.length, 2)
+    assert.deepEqual(temperatureEpisodes.find(item => item.id === temperatureBefore.id), temperatureAfterRestart)
+    assert.equal(temperatureEpisodes.find(item => item.id !== temperatureBefore.id).status, 'active')
 
     // 重連後的同一頁隨已提交回報恢復，並顯示這次恢復的有效回報時間。
-    await page.getByText('在線', { exact: true }).waitFor()
-    await page.getByText('30°C', { exact: true }).waitFor()
-    assert.equal(await page.getByText('資料已非即時', { exact: true }).count(), 0,
+    await detail.getByText('在線', { exact: true }).waitFor()
+    await detail.getByText('30.0°C', { exact: true }).waitFor()
+    assert.equal(await detail.getByText('資料已非即時', { exact: true }).count(), 0,
       '恢復在線後須自動清除非即時提示')
-    assert.equal(await page.locator('time[datetime]').getAttribute('datetime'), recoveredDevice.latestMeasurement.receivedAt,
+    assert.equal(await detail.locator('time[datetime]').getAttribute('datetime'), recoveredDevice.latestMeasurement.receivedAt,
       '恢復後畫面須顯示已提交的新回報時間')
 
     // 驗收結尾檢查實際頁面與遮蔽後的錯誤清單，讓建置或腳本問題也能使測試失敗。

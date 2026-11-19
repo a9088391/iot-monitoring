@@ -37,7 +37,7 @@ async function signIn(page, username, password, origin) {
     throw new Error('瀏覽器登入表單操作失敗')
   }
   await json(response, 200, '登入')
-  await page.getByRole('heading', { name: '設備清單', level: 2, exact: true }).waitFor()
+  await page.getByRole('heading', { name: '設備清單', level: 1, exact: true }).waitFor()
 }
 
 // 同時驗證外層頁面及長純文字的儲存格，避免內層裁切掩蓋溢出。
@@ -117,9 +117,10 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     const page = await context.newPage()
     page.setDefaultTimeout(8_000)
     const historyButton = page.getByRole('button', { name: '告警歷程', exact: true })
-    const deviceButton = page.getByRole('button', { name: '設備清單', exact: true })
-    const historyTitle = page.getByRole('heading', { name: '告警歷程', exact: true })
-    const detailTitle = page.getByRole('heading', { name: '告警詳情', exact: true })
+    const deviceButton = page.getByRole('button', { name: '模擬展示', exact: true })
+    const historyBoard = page.getByRole('region', { name: '告警歷程', exact: true })
+    const detail = page.getByRole('region', { name: /^告警 #\d+$/ })
+    const detailTitle = detail.getByRole('heading', { name: /^告警 #\d+$/ })
     const back = page.getByRole('button', { name: '返回告警歷程' })
     const input = page.getByLabel('處理結果', { exact: true })
     const submit = page.getByRole('button', { name: '結案', exact: true })
@@ -127,10 +128,12 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     const accountMessage = page.getByText('登入狀態已失效，請重新登入。', { exact: true })
     const focus = page.locator(':focus')
     // 以 API 識別碼鎖定操作的告警，避免選中同設備其他紀錄。
-    const row = item => page.getByRole('button', { name: `#${item.id} · 溫度異常 · ${item.deviceId}` })
+    const row = item => historyBoard.getByRole('button')
+      .filter({ has: page.getByText(`#${item.id} 溫度異常`, { exact: true }) })
+      .filter({ has: page.getByText(item.deviceId, { exact: true }) })
     const detailPath = item => `${alertsPath}/${item.id}`
     const closePath = item => `${detailPath(item)}/close`
-    const detailValue = label => page.locator('dl > div')
+    const detailValue = label => detail.locator('dl > div')
       .filter({ has: page.getByText(label, { exact: true }) })
       .locator('dd')
 
@@ -205,19 +208,27 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
       await page.keyboard.press('Enter')
     }
 
-    // 從歷程標題按 Tab 經過重新載入及每筆告警，才到可用的分頁按鈕。
-    async function changePageWithKeyboard(button, rowCount) {
-      for (let step = 0; step < rowCount + 2; step += 1) {
+    // 逐次走實際 Tab 順序，保留筆數上限，避免版面增加控制項後默默跳過鍵盤驗收。
+    async function tabTo(target, maximum) {
+      for (let step = 0; step < maximum; step += 1) {
         await page.keyboard.press('Tab')
+        if (await focus.and(target).count() === 1) return
       }
-      assert.equal(await focus.and(button).count(), 1, '按 Enter 前應已聚焦分頁按鈕')
+      assert.fail('在預期的鍵盤順序內未到達目標控制項')
+    }
+
+    // 從監控區塊經過每筆告警到分頁，再核對換頁後的焦點復原。
+    async function changePageWithKeyboard(button, rowCount) {
+      await tabTo(button, rowCount + 3)
       await page.keyboard.press('Enter')
-      await focus.and(historyTitle).waitFor()
+      await focus.and(historyBoard).waitFor()
     }
 
     // 核對唯讀結果的 DOM 原文、結案人、UTC 屬性與臺灣時間。
     async function expectReadOnly(closure) {
-      await page.getByText(closed, { exact: true }).waitFor()
+      await detail.getByText(closed, { exact: true }).waitFor()
+      assert.equal(await historyBoard.locator('.alert-button[aria-pressed="true"]').getByText(closed, { exact: true }).count(), 1,
+        '結案後同一筆清單狀態也須更新')
       const result = detailValue('處理結果')
       assert.equal(await result.textContent(), closure.result)
       assert.equal(await result.evaluate(element => element.childElementCount), 0, '純文字不得成為 HTML 節點')
@@ -238,11 +249,11 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
       return result
     }
 
-    await page.goto(stack.origin)
+    await page.goto(stack.origin + '/?view=simulation')
     const northCookie = await browserSignIn('north')
     assert.equal(await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone), 'UTC')
     await historyButton.press('Enter')
-    await focus.and(historyTitle).waitFor()
+    await focus.and(historyBoard).waitFor()
     await page.getByText('共 52 筆告警', { exact: true }).waitFor()
 
     const pager = page.getByRole('navigation', { name: '告警歷程分頁' })
@@ -253,8 +264,8 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
       .map(item => item.id)
     const firstPageIDs = northIDs.slice(0, 50)
     const secondPageIDs = northIDs.slice(50)
-    const rowIDs = () => page.locator('button.alert-button > span:first-child')
-      .evaluateAll(elements => elements.map(element => element.textContent.match(/^#(\d+) · /)?.[1]))
+    const rowIDs = () => historyBoard.locator('.alert-name')
+      .evaluateAll(elements => elements.map(element => element.textContent.match(/^#(\d+) /)?.[1]))
     await pager.getByText('第 1 / 2 頁', { exact: true }).waitFor()
     assert.equal(await previous.isDisabled(), true)
     assert.deepEqual(await rowIDs(), firstPageIDs)
@@ -270,14 +281,14 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     await checkLayout(page, 1280, 900)
 
     await row(northActive).press('Enter')
-    await page.getByText('異常持續中', { exact: true }).waitFor()
+    await detail.getByText('異常持續中', { exact: true }).waitFor()
     assert.equal(await input.count(), 0)
     assert.equal(await submit.count(), 0)
     await back.press('Enter')
     await row(northRecovered).press('Enter')
-    await focus.and(detailTitle).waitFor()
-    await page.getByText(recovered, { exact: true }).waitFor()
-    await page.keyboard.press('Tab')
+    await focus.and(historyBoard).waitFor()
+    await detail.getByText(recovered, { exact: true }).waitFor()
+    await tabTo(input, firstPageIDs.length + 3)
     await focus.and(input).waitFor()
 
     // 先走瀏覽器端驗證，再以內含 Tab 的本文走真實服務輸入錯誤。
@@ -346,7 +357,7 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
 
     await back.click()
     await row(northUnknown).click()
-    await page.getByText(recovered, { exact: true }).waitFor()
+    await detail.getByText(recovered, { exact: true }).waitFor()
     const unknownDraft = '第二筆已確認\n保持原文'
     await input.fill(unknownDraft)
     let committed
@@ -393,6 +404,9 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
       assert.equal(await submit.isDisabled(), true)
       assert.equal(await back.isDisabled(), true)
       assert.equal(await deviceButton.isDisabled(), true)
+      assert.equal(await row(northActive).isDisabled(), true, '未知結果讀回中不得改選旁邊的告警')
+      assert.equal(await next.isDisabled(), true, '未知結果讀回中不得換頁')
+      assert.equal(await page.getByRole('button', { name: '重新載入', exact: true }).isDisabled(), true)
     } finally {
       releaseReadback.resolve()
     }
@@ -404,6 +418,10 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     assert.equal(await input.inputValue(), unknownDraft)
     assert.equal(await input.getAttribute('readonly'), '')
     assert.equal(await submit.isDisabled(), true)
+    assert.equal(await row(northActive).isDisabled(), true, '結果仍未確認時須保留原告警與草稿')
+    await row(northActive).press('Enter')
+    assert.equal(await detailTitle.textContent(), `告警 #${northUnknown.id}`)
+    assert.equal(await input.inputValue(), unknownDraft, '旁邊的告警不得清除未確認的草稿')
     assert.equal(await page.getByText(success, { exact: true }).count(), 0)
     assert.ok(committed && droppedReadback, '第一次提交及讀回都必須實際到達服務')
     assert.equal(committed.closure.result, unknownDraft)
@@ -459,7 +477,7 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     await browserSignIn('south')
     await historyButton.click()
     await row(southRecovered).click()
-    await page.getByText(recovered, { exact: true }).waitFor()
+    await detail.getByText(recovered, { exact: true }).waitFor()
     assert.equal(await input.inputValue(), '', '重新登入應建立新草稿')
     await page.getByRole('button', { name: '登出', exact: true }).click()
     await page.getByText('已登出。', { exact: true }).waitFor()
@@ -467,7 +485,7 @@ test('IoT 票 05：真實瀏覽器結案、場域歷程及失敗復原', { timeo
     await historyButton.click()
     await row(northRecovered).waitFor()
     await row(southRecovered).click()
-    await page.getByText(recovered, { exact: true }).waitFor()
+    await detail.getByText(recovered, { exact: true }).waitFor()
     assert.equal(await input.inputValue(), '', '切換帳號不得帶入原草稿')
     assert.deepEqual(closeRequests, [
       closePath(northRecovered), closePath(northRecovered), closePath(northRecovered),

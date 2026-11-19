@@ -17,7 +17,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const simulationBeforeFile = "before-simulation-restart.json"
+const (
+	simulationBeforeFile   = "before-simulation-restart.json"
+	normalSimulationSample = 0
+)
 
 type observedSimulationSample struct {
 	sample  Measurement
@@ -93,7 +96,7 @@ func TestSimulationIntegration(t *testing.T) {
 	// 驗證開始後立即送出指定溫度，且重送不改變任一設備的週期。
 	if !t.Run("immediate temperature, independent cadence and exact replay", func(t *testing.T) {
 		controlSimulation(t, f, "north-01", "normal", "0", simulationState{"normal", "1", true})
-		first := expectSimulationSample(t, observations, "north-01", 23, true)
+		first := expectSimulationSample(t, observations, "north-01", normalSimulationSample, true)
 		expectLatestSimulationSample(t, f, first)
 
 		// 刻意錯開兩台設備的開始時點，並在兩次回報之間重送第一台的原始回報。
@@ -104,7 +107,7 @@ func TestSimulationIntegration(t *testing.T) {
 		south := expectSimulationSample(t, observations, "south-02", 30, true)
 		before := f.snapshot(t)
 		controlSimulation(t, f, "north-01", "replay", "1", simulationState{"normal", "2", true})
-		if replay := expectSimulationSample(t, observations, "north-01", 23, false); replay != first {
+		if replay := expectSimulationSample(t, observations, "north-01", normalSimulationSample, false); replay != first {
 			t.Fatalf("replay changed original sample: got %+v, want %+v", replay, first)
 		}
 		if got := f.snapshot(t); got != before {
@@ -112,7 +115,11 @@ func TestSimulationIntegration(t *testing.T) {
 		}
 		// 用各設備的第一筆為基準驗證下一筆時間、順序和執行識別。
 		for _, original := range []Measurement{first, south} {
-			next := expectSimulationSample(t, observations, original.DeviceID, original.Temperature, true)
+			temperature := original.Temperature
+			if temperature != 30 {
+				temperature = normalSimulationSample
+			}
+			next := expectSimulationSample(t, observations, original.DeviceID, temperature, true)
 			elapsed := next.GeneratedAt.Sub(original.GeneratedAt)
 			if next.Sequence != original.Sequence+1 ||
 				next.RunID != original.RunID ||
@@ -159,7 +166,7 @@ func TestSimulationIntegration(t *testing.T) {
 		if err := json.Unmarshal([]byte(outcomes[0].body), &winner); err != nil {
 			t.Fatal(err)
 		}
-		temperature := 23.0
+		temperature := float64(normalSimulationSample)
 		if winner.Mode == "abnormal" {
 			temperature = 30
 		} else if winner.Mode != "normal" {
@@ -217,7 +224,7 @@ func TestSimulationIntegration(t *testing.T) {
 			pending <- sendSimulation(t.Context(), f, "north-02", simulationBody("normal", "0"), f.hq, true)
 		}()
 		first := waitForSimulation(t, held)
-		if first.DeviceID != "north-02" || first.Temperature != 23 {
+		if first.DeviceID != "north-02" || !validNormalSimulationSample(first.Temperature) {
 			t.Fatalf("unexpected pending first sample: %+v", first)
 		}
 		expectedAt := simulationFirstExpected(t, conn, "north-02")
@@ -225,7 +232,7 @@ func TestSimulationIntegration(t *testing.T) {
 		controlSimulation(t, f, "north-02", "stop", "1", simulationState{"stopped", "2", true})
 		release <- struct{}{}
 		expectSimulationHTTPState(t, waitForSimulation(t, pending), simulationState{"normal", "1", true})
-		if rejected := expectSimulationSample(t, observations, "north-02", 23, false); rejected != first {
+		if rejected := expectSimulationSample(t, observations, "north-02", normalSimulationSample, false); rejected != first {
 			t.Fatalf("old pending sample changed before delivery: %+v", rejected)
 		}
 		if f.snapshot(t) != before || simulationFirstExpected(t, conn, "north-02") != expectedAt {
@@ -262,7 +269,7 @@ func TestSimulationIntegration(t *testing.T) {
 			t.Fatalf("expected a canceled HTTP request, got %+v", result)
 		}
 		release <- struct{}{}
-		if delivered := expectSimulationSample(t, observations, "north-03", 23, true); delivered != first {
+		if delivered := expectSimulationSample(t, observations, "north-03", normalSimulationSample, true); delivered != first {
 			t.Fatalf("canceled HTTP client changed accepted delivery: %+v", delivered)
 		}
 		expectLatestSimulationSample(t, f, first)
@@ -274,7 +281,7 @@ func TestSimulationIntegration(t *testing.T) {
 
 	// 切換模式要換執行識別並延續順序，舊執行即使送來更新的樣本也不生效。
 	controlSimulation(t, f, "north-01", "normal", "3", simulationState{"normal", "4", true})
-	old := expectSimulationSample(t, observations, "north-01", 23, true)
+	old := expectSimulationSample(t, observations, "north-01", normalSimulationSample, true)
 	controlSimulation(t, f, "north-01", "abnormal", "4", simulationState{"abnormal", "5", true})
 	current := expectSimulationSample(t, observations, "north-01", 30, true)
 	if old.RunID == current.RunID || old.Sequence >= current.Sequence {
@@ -329,7 +336,7 @@ func TestSimulationRestart(t *testing.T) {
 		t.Fatalf("expected restart of seeded PostgreSQL cluster, previous start %s, current %s", before.StartedAt, target.startedAt)
 	}
 	t.Logf("PostgreSQL postmaster restarted: %s -> %s", before.StartedAt, target.startedAt)
-	// 沿用啟動步驟及新模擬器，檢查模式停止、版本更新和無原始樣本可重送。
+	// 先檢查撤銷舊執行的中間狀態，再驗證補判後的自動正常回報。
 	ctx, conn := t.Context(), target.conn
 	startupSimulationFixture(t, conn, state)
 	passwords, err := demoPasswords(state, false)
@@ -360,17 +367,26 @@ func TestSimulationRestart(t *testing.T) {
 	if got := f.snapshot(t); got != before.API {
 		t.Fatal("restart or prior execution changed latest measurements or alerts")
 	}
-	// 重新啟動設備應換執行識別、接續順序，並保留未首報設備的原始期待。
-	controlSimulation(t, f, "north-01", "normal", "6", simulationState{"normal", "7", true})
+	// 自動啟動應換執行識別、接續順序，並保留未首報設備的原始期待。
+	if err := app.scanOffline(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.startDemoSimulations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	expectSimulation(t, f, "north-01", simulationState{"normal", "7", true})
+	expectSimulation(t, f, "north-02", simulationState{"normal", "6", true})
+	expectSimulation(t, f, "south-03", simulationState{"normal", "3", true})
+	expectSimulationHistory(t, conn, "north-01", "normal,replay,stop,normal,abnormal")
 	if newest := latestSimulationSample(t, f, "north-01"); newest == nil ||
-		newest.Temperature != 23 ||
+		!validNormalSimulationSample(newest.Temperature) ||
 		newest.Sequence <= before.Active.Sequence {
 		t.Fatalf("new execution did not continue measurement order: %+v", newest)
 	}
 	if run := simulationRunID(t, conn, "north-01"); run == before.Active.RunID {
 		t.Fatalf("new execution reused prior run identity: %d", run)
 	}
-	controlSimulation(t, f, "south-03", "abnormal", "2", simulationState{"abnormal", "3", true})
+	controlSimulation(t, f, "south-03", "abnormal", "3", simulationState{"abnormal", "4", true})
 	if simulationFirstExpected(t, conn, "south-03") != before.FirstExpected {
 		t.Fatal("new start after restart reset the unanswered first expectation")
 	}
@@ -532,7 +548,8 @@ func expectSimulationSample(t *testing.T, input <-chan observedSimulationSample,
 		got.adopted != adopted ||
 		got.sample.DeviceID != id ||
 		got.sample.Source != SimulatorMeasurementSource ||
-		got.sample.Temperature != temperature {
+		(temperature == normalSimulationSample && !validNormalSimulationSample(got.sample.Temperature) ||
+			temperature != normalSimulationSample && got.sample.Temperature != temperature) {
 		t.Fatalf("unexpected simulated report for %s: %+v", id, got)
 	}
 	return got.sample
@@ -622,4 +639,9 @@ func expectSimulationHistory(t *testing.T, conn *sql.Conn, id, want string) {
 		!actorsAndTimes {
 		t.Fatalf("unexpected control history for %s: got %q, actors/times valid=%v, error=%v; want %q", id, actions, actorsAndTimes, err, want)
 	}
+}
+
+// validNormalSimulationSample 獨立核對正常值範圍，避免用產生器本身當作測試答案。
+func validNormalSimulationSample(value float64) bool {
+	return value >= 18 && value <= 28
 }

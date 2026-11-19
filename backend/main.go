@@ -190,10 +190,13 @@ func runApplication(ctx context.Context, check func(context.Context, *sql.Conn, 
 		}
 		defer cleanup()
 	}
-	// 解除啟動期限，以服務生命週期管理後續模擬。
-	cancel()
+	// 先補判停機再啟動種子設備，首筆仍受啟動期限約束，計時器使用服務生命週期。
 	a.simulator = newSimulator(ctx, a.SubmitMeasurement)
 	defer a.simulator.close()
+	if err := a.startDemoSimulations(startup); err != nil {
+		return operationFailure("start automatic demo reporting", err)
+	}
+	cancel()
 	return a.serve(ctx)
 }
 

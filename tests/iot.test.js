@@ -80,11 +80,11 @@ async function browserFlow(origin, passwords, tokens) {
     const context = await browser.newContext()
     const page = await context.newPage()
     page.setDefaultTimeout(8_000)
-    await page.goto(origin, { timeout: 10_000 })
+    await page.goto(origin + '/?view=simulation', { timeout: 10_000 })
     const account = page.getByLabel('帳號', { exact: true })
     const password = page.getByLabel('密碼', { exact: true })
     const logout = page.getByRole('button', { name: '登出', exact: true })
-    const listItems = page.getByRole('listitem')
+    const listItems = page.getByRole('region', { name: '設備監控', exact: true }).getByRole('listitem')
     // 依展示設備識別組成可見名稱，以驗證畫面標籤而非內部資料。
     const deviceName = (id) => `${id.startsWith('north') ? '北區' : '南區'}設備 ${id.slice(-2)}`
 
@@ -103,9 +103,14 @@ async function browserFlow(origin, passwords, tokens) {
     async function checkList(ids) {
       await page.getByRole('button', { name: new RegExp(deviceName(ids.at(-1))) }).waitFor()
       // 新設備的即時狀態也須在清單上以文字顯示。
-      const actual = (await listItems.allInnerTexts()).map(text => text.replace(/\s+/g, ' ').trim())
-      const expected = ids.map(id => `${deviceName(id)} ${id.startsWith('north') ? '北區場域' : '南區場域'} 尚未回報`)
-      check(actual, expected, '瀏覽器設備清單與登入範圍不符')
+      check(await listItems.locator('.device-name').allTextContents(), ids.map(deviceName), '瀏覽器設備清單與登入範圍不符')
+      check(await listItems.locator('.device-site').allTextContents(),
+        ids.map(id => id.startsWith('north') ? '北區場域' : '南區場域'), '場域名稱不符')
+      check(await listItems.locator('.status').allTextContents(), ids.map(() => '在線'), '自動回報須在線')
+      for (const text of await listItems.locator('.row-temperature').allTextContents()) {
+        assert.match(text, /^\d+(?:\.\d+)?°C$/)
+        assert.ok(parseFloat(text) >= 18 && parseFloat(text) <= 28, '自動回報須在正常範圍')
+      }
     }
 
     // 檢查登出從請求到 Cookie 移除的結果，也能驗證第一次中斷後的手動復原。
@@ -175,7 +180,7 @@ async function browserFlow(origin, passwords, tokens) {
       await otherService[Symbol.asyncDispose]()
     }
     // 回到正式主機仍能讀清單，並確認探測服務確實收到請求且未收到 session。
-    await page.goto(origin)
+    await page.goto(origin + '/?view=simulation')
     await checkList(inventory)
     assert.notEqual(receivedSession, undefined, '另一個本機服務須收到探測請求')
     assert.equal(receivedSession, false, '另一個本機服務不得收到 iot_session')
@@ -183,7 +188,8 @@ async function browserFlow(origin, passwords, tokens) {
     // 從清單進出詳細頁，再以重載驗證瀏覽器仍能恢復有效登入。
     await page.getByRole('button', { name: /北區設備 01/ }).click()
     await page.getByRole('heading', { name: '北區設備 01', exact: true }).waitFor()
-    await page.getByText('north-01', { exact: true }).waitFor()
+    await page.getByRole('region', { name: '北區設備 01', exact: true })
+      .getByText('north-01 · 北區場域', { exact: true }).waitFor()
     await page.getByRole('button', { name: /返回設備清單/ }).click()
     await checkList(inventory)
     await page.reload()

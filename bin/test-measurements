@@ -3,15 +3,23 @@ set -eu
 unset CDPATH
 cd -P "$(dirname "$0")/.."
 
+# race 模式沿用同一組整合案例與隔離資料庫，只更換測試執行檔的編譯環境。
+race=false
+if [ "${1:-}" = --race ]; then
+    race=true
+    shift
+fi
+
 # 每次只選一組整合與重啟測試，兩段共用同一個 PostgreSQL 資料卷。
 case "$#:${1:-}" in
     0:) suite=Measurement ;;
+    1:automatic) suite=AutomaticSimulation ;;
     1:simulation) suite=Simulation ;;
     1:offline) suite=Offline ;;
     1:closure) suite=Closure ;;
     1:sse) suite=SSE ;;
     1:reset) suite=Reset ;;
-    *) printf '%s\n' '用法：bin/test-measurements [simulation|offline|closure|sse|reset]' >&2; exit 2 ;;
+    *) printf '%s\n' '用法：bin/test-measurements [--race] [automatic|simulation|offline|closure|sse|reset]' >&2; exit 2 ;;
 esac
 integration_test=Test${suite}Integration
 restart_test=Test${suite}Restart
@@ -28,7 +36,7 @@ case "$endpoint" in
     unix:///?*) ;;
     *) printf '%s\n' '測量測試需要本機 Docker Unix socket。' >&2; exit 1 ;;
 esac
-unset DOCKER_CONTEXT DOCKER_HOST
+unset DOCKER_CONTEXT DOCKER_HOST BUILDX_BUILDER BUILDKIT_HOST
 # 所有測試操作固定同一個已驗證的 socket，清理時也使用該端點。
 docker_local() {
     docker --host "$endpoint" "$@"
@@ -52,15 +60,29 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
 # 編譯與資料庫映像架構相容的測試程式，讓測試能直接在隔離容器內執行。
-(cd backend && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-    go test -c -o "$temporary/measurements.test" .)
+if "$race"; then
+    compiler=$(docker_local build --builder default --quiet --platform "linux/$arch" --target backend-test .)
+    printf 'race compiler: %s\n' "$compiler"
+    docker_local run --rm --network none --platform "linux/$arch" \
+        --mount "type=bind,src=$temporary,dst=/test-output" "$compiler" \
+        cp /out/measurements.test /test-output/measurements.test
+else
+    (cd backend && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+        go test -c -o "$temporary/measurements.test" .)
+fi
 
 # 重設測試使用實際維護命令及 TCP 密碼認證。測試專用標記避免誤用正常展示庫。
 database=iot_measurement_test
 if [ "$suite" = Reset ]; then
     database=iot
-    (cd backend && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
-        go build -trimpath -o "$temporary/reset-app" .)
+    if "$race"; then
+        docker_local run --rm --network none --platform "linux/$arch" \
+            --mount "type=bind,src=$temporary,dst=/test-output" "$compiler" \
+            cp /out/reset-app /test-output/reset-app
+    else
+        (cd backend && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+            go build -trimpath -o "$temporary/reset-app" .)
+    fi
     container=$(docker_local run --pull=never -d --network none --volume /var/lib/postgresql \
         -e POSTGRES_USER=iot -e POSTGRES_DB="$database" \
         -e POSTGRES_PASSWORD=iot-reset-fixture-password -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \

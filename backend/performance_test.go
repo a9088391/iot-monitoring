@@ -56,9 +56,10 @@ type performanceClockMessage struct {
 }
 
 type performanceRunResult struct {
-	Complete bool   `json:"complete"`
-	Events   int    `json:"events"`
-	Error    string `json:"error,omitempty"`
+	Complete    bool                         `json:"complete"`
+	Events      int                          `json:"events"`
+	Error       string                       `json:"error,omitempty"`
+	Diagnostics *performanceDiagnosticResult `json:"diagnostics,omitempty"`
 }
 
 // TestPerformanceStack 在隔離容器執行正式服務，負載經同一程序的測量入口進入。
@@ -289,11 +290,7 @@ func servePerformanceFiles(ctx context.Context, app *application, state *os.Root
 			running, started = done, true
 			// 負載排程獨立於時基回覆，長時間量測仍可重新校正。
 			go func() {
-				count, err := recordPerformanceLoad(ctx, app, state, devices, start)
-				result := performanceRunResult{Complete: err == nil, Events: count}
-				if err != nil {
-					result.Error = err.Error()
-				}
+				result, err := recordPerformanceLoad(ctx, app, state, devices, start)
 				done <- errors.Join(err, writePerformanceJSON(state, performanceResult, result, false))
 			}()
 		}

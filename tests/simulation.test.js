@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter, once } from 'node:events'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -6,7 +7,7 @@ import { setTimeout } from 'node:timers/promises'
 import { createStack } from './stack.js'
 
 const simulationPath = '/api/devices/north-01/simulation'
-const controlLabels = ['開始正常回報', '開始異常回報', '停止回報', '重複回報']
+const controlLabels = ['恢復正常', '開始異常回報', '停止回報', '重複回報']
 const loginFormError = '瀏覽器登入表單操作失敗'
 
 // 正規化 Node 與 Playwright 回應的狀態介面，解析失敗只保留驗收階段。
@@ -76,7 +77,7 @@ async function signIn(page, username, password, origin) {
   }
   // 登入成功須同時收到 HTTP 回應並進入設備清單。
   await responseJson(response, 200, '登入')
-  await page.getByRole('heading', { name: '設備清單', level: 2, exact: true }).waitFor()
+  await page.getByRole('heading', { name: '設備清單', level: 1, exact: true }).waitFor()
 }
 
 // 以真實畫面與服務驗證模擬控制、版本衝突、結果不明後的復原及重啟。
@@ -150,7 +151,7 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     // 恢復正常操作時限再進入正式頁面，依注入旗標判斷哪些資源錯誤可略過。
     hqPage.setDefaultTimeout(8_000)
     monitorBrowserErrors(hqPage, passwords, browserErrors, stack.origin, expectedResources, () => injectedUnknownResponse)
-    await hqPage.goto(stack.origin, { timeout: 10_000 })
+    await hqPage.goto(stack.origin + '/?view=simulation', { timeout: 10_000 })
     await signIn(hqPage, 'hq', passwords.hq, stack.origin)
     // 取出正式主機的 session，供第二個控制端與操作後讀回共用。
     const hqSession = (await hqContext.cookies(stack.origin)).find(cookie => cookie.name === 'iot_session')
@@ -172,15 +173,25 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
       })
     }
 
-    // 進入新設備詳細頁，確認停止狀態與無原始測量時的重送限制。
-    await hqPage.getByRole('button', { name: /北區設備 01/ }).click()
-    await hqPage.getByRole('heading', { name: '模擬控制', level: 3, exact: true }).waitFor()
-    await hqPage.getByText('north-01', { exact: true }).waitFor()
-    await hqPage.getByText('尚未回報', { exact: true }).waitFor()
-    await hqPage.getByText('模擬模式：已停止', { exact: true }).waitFor()
+    // 額外未啟動設備保留無原始測量分支；六台種子仍維持真實自動回報。
+    stack.sql("INSERT INTO devices(id,name,site_id) VALUES ('north-00','未回報夾具','north');")
+    await hqPage.reload()
+    const emptyDetail = hqPage.getByRole('region', { name: '未回報夾具', exact: true })
+    await emptyDetail.getByText('尚未回報', { exact: true }).waitFor()
+    assert.equal(await emptyDetail.getByRole('button', { name: '重複回報', exact: true }).isDisabled(), true)
+    await emptyDetail.getByText('尚無可重送的測量。', { exact: true }).waitFor()
+    stack.sql("DELETE FROM devices WHERE id = 'north-00';")
+    await hqPage.reload()
+    const deviceList = hqPage.getByRole('region', { name: '設備監控', exact: true }).getByRole('list')
+    const northRow = deviceList.getByRole('button', { name: /北區設備 01/ })
+    const detail = hqPage.getByRole('region', { name: '北區設備 01', exact: true })
+    await northRow.click()
+    await hqPage.getByRole('heading', { name: '展示情境', level: 3, exact: true }).waitFor()
+    await detail.getByText('north-01 · 北區場域', { exact: true }).waitFor()
+    await detail.getByText('在線', { exact: true }).waitFor()
+    await hqPage.getByText('模擬模式：正常回報', { exact: true }).waitFor()
     const replayButton = hqPage.getByRole('button', { name: '重複回報', exact: true })
-    assert.equal(await replayButton.isDisabled(), true, '沒有原始測量時不得啟用重送')
-    await hqPage.getByText('尚無可重送的測量。', { exact: true }).waitFor()
+    assert.equal(await replayButton.isEnabled(), true, '自動採用首報後應已有可重送測量')
 
     // 在實際瀏覽器驗證指定尺寸、控制按鈕及頁面是否水平溢位。
     async function checkViewport(width, height) {
@@ -199,10 +210,8 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
       assert.equal(await hqPage.evaluate(() => window.innerHeight), height, '瀏覽器需使用指定檢查高度')
     }
 
-    // 先以桌面再切換手機尺寸，後續控制流程也實際使用窄版。
+    // 首次控制先驗證桌面雙區同步，再以窄版完成後續控制流程。
     await checkViewport(1280, 900)
-    await hqPage.setViewportSize({ width: 390, height: 844 })
-    await checkViewport(390, 844)
 
     const pageControls = []
     // 記錄瀏覽器發出的控制操作與版本，讓自動重送或格式錯誤可在後續查出。
@@ -218,7 +227,7 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     })
 
     // 以鍵盤送出首次控制，並核對成功回應、模式、溫度及畫面提示。
-    const normalButton = hqPage.getByRole('button', { name: '開始正常回報', exact: true })
+    const normalButton = hqPage.getByRole('button', { name: '恢復正常', exact: true })
     await normalButton.focus()
     // 在瀏覽器內確認實際焦點，驗證操作可用鍵盤完成。
     assert.equal(await normalButton.evaluate(element => document.activeElement === element), true, '控制項須可由鍵盤取得焦點')
@@ -227,11 +236,19 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
       hqPage.waitForResponse(item => item.url() === stack.origin + simulationPath && item.request().method() === 'POST'),
       normalButton.press('Enter'),
     ])
-    const normalState = await responseJson(normalResponse, 200, '開始正常回報')
-    assert.equal(normalState.mode, 'normal', '開始正常回報須切換至正常模式')
+    const normalState = await responseJson(normalResponse, 200, '恢復正常')
+    assert.equal(normalState.mode, 'normal', '恢復正常須切換至正常模式')
     await hqPage.getByText('模擬模式：正常回報', { exact: true }).waitFor()
-    await hqPage.getByText('23°C', { exact: true }).waitFor()
-    await hqPage.getByText('已開始正常回報。', { exact: true }).waitFor()
+    const normalDevice = await responseJson(await sendAsHq('/api/devices/north-01'), 200, '恢復正常後讀回')
+    assert.ok(normalDevice.latestMeasurement.temperature >= 18 && normalDevice.latestMeasurement.temperature <= 28)
+    const normalText = `${Number.isInteger(normalDevice.latestMeasurement.temperature)
+      ? normalDevice.latestMeasurement.temperature.toFixed(1) : normalDevice.latestMeasurement.temperature}°C`
+    await detail.getByText(normalText, { exact: true }).waitFor()
+    await northRow.getByText(normalText, { exact: true }).waitFor()
+    assert.equal(await deviceList.isVisible(), true, '桌面控制後清單仍須與詳情同時可見')
+    await hqPage.getByText('已恢復正常回報。', { exact: true }).waitFor()
+    await hqPage.setViewportSize({ width: 390, height: 844 })
+    await checkViewport(390, 844)
 
     // 在舊快照已讀取後保留它，直到瀏覽器送出控制，避免即時讀回提前消除版本衝突。
     const priorSnapshot = await responseJson(await sendAsHq(simulationPath), 200, '原模擬快照')
@@ -262,7 +279,7 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
       .filter({ hasText: '模擬狀態已變更，請確認目前模式後再操作。' })
       .waitFor()
     await hqPage.getByText('模擬模式：異常回報', { exact: true }).waitFor()
-    await hqPage.getByText('30°C', { exact: true }).waitFor()
+    await detail.getByText('30.0°C', { exact: true }).waitFor()
     // 從請求紀錄取出操作名稱，確認衝突後沒有另一筆寫入。
     assert.deepEqual(pageControls.map(control => control.action), ['normal', 'normal'], '衝突控制不得自動重送')
     assert.equal(pageControls[1].version, normalState.version, '衝突請求須保留瀏覽器先前讀到的版本')
@@ -277,7 +294,7 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     assert.equal(replayState.mode, 'abnormal', '重送不得改變目前模擬模式')
     await hqPage.getByText('已重送最近一筆原始測量。', { exact: true }).waitFor()
     await hqPage.getByText('模擬模式：異常回報', { exact: true }).waitFor()
-    await hqPage.getByText('30°C', { exact: true }).waitFor()
+    await detail.getByText('30.0°C', { exact: true }).waitFor()
 
     // 手動停止後同時檢查畫面與控制次數，確認沒有額外的瀏覽器寫入。
     const stopResponsePromise = hqPage.waitForResponse(
@@ -289,7 +306,7 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     assert.equal(stoppedState.mode, 'stopped', '停止操作須結束模擬回報')
     await hqPage.getByText('已停止模擬回報。', { exact: true }).waitFor()
     await hqPage.getByText('模擬模式：已停止', { exact: true }).waitFor()
-    await hqPage.getByText('30°C', { exact: true }).waitFor()
+    await detail.getByText('30.0°C', { exact: true }).waitFor()
     // 用紀錄中的操作順序核對畫面只送出使用者明確要求的控制。
     assert.deepEqual(pageControls.map(control => control.action), ['normal', 'normal', 'replay', 'stop'],
       '只允許明確操作的瀏覽器控制請求')
@@ -306,13 +323,15 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     sitePage.setDefaultTimeout(8_000)
     // 沿用有上限的診斷例外與注入旗標，讓場域頁面的意外錯誤也能被捕捉。
     monitorBrowserErrors(sitePage, passwords, browserErrors, stack.origin, expectedResources, () => injectedUnknownResponse)
-    await sitePage.goto(stack.origin, { timeout: 10_000 })
+    await sitePage.goto(stack.origin + '/?view=simulation', { timeout: 10_000 })
     await signIn(sitePage, 'north', passwords.north, stack.origin)
-    assert.equal(await sitePage.getByRole('listitem').count(), 3, '北區帳號只可見所屬場域設備')
+    assert.equal(await sitePage.getByRole('region', { name: '設備監控', exact: true }).getByRole('listitem').count(), 3,
+      '北區帳號只可見所屬場域設備')
     assert.equal(await sitePage.getByRole('button', { name: /南區設備/ }).count(), 0, '北區帳號不得看見南區設備')
     await sitePage.getByRole('button', { name: /北區設備 01/ }).click()
-    await sitePage.getByText('north-01', { exact: true }).waitFor()
-    assert.equal(await sitePage.getByRole('heading', { name: '模擬控制', level: 3, exact: true }).count(), 0,
+    await sitePage.getByRole('region', { name: '北區設備 01', exact: true })
+      .getByText('north-01 · 北區場域', { exact: true }).waitFor()
+    assert.equal(await sitePage.getByRole('heading', { name: '展示情境', level: 3, exact: true }).count(), 0,
       '場域帳號詳細頁不得提供模擬控制區')
     for (const label of controlLabels) {
       assert.equal(await sitePage.getByRole('button', { name: label, exact: true }).count(), 0,
@@ -352,7 +371,7 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     const [unknownResponse] = await Promise.all([
       // 只接收這次控制的 POST，確認瀏覽器端確實收到合成錯誤。
       hqPage.waitForResponse(item => item.url() === stack.origin + simulationPath && item.request().method() === 'POST'),
-      hqPage.getByRole('button', { name: '開始正常回報', exact: true }).click(),
+      hqPage.getByRole('button', { name: '恢復正常', exact: true }).click(),
     ])
     await hqPage.unroute(stack.origin + simulationPath)
     // 先確認控制真實提交與回應替換都成立，再判斷畫面的復原結果。
@@ -368,11 +387,14 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
       .filter({ hasText: '未能確認操作結果。請確認目前模擬狀態後再操作。' })
       .waitFor()
     await hqPage.getByText('模擬模式：正常回報', { exact: true }).waitFor()
-    await hqPage.getByText('23°C', { exact: true }).waitFor()
+    await detail.locator('.temperature-value').filter({ hasText: /°C$/ }).waitFor()
     const unknownReadback = await responseJson(await sendAsHq(simulationPath), 200, '未知結果後模擬讀回')
     const unknownDevice = await responseJson(await sendAsHq('/api/devices/north-01'), 200, '未知結果後設備讀回')
     assert.equal(unknownReadback.mode, 'normal', '未知結果後讀回須辨識已提交的正常模式')
-    assert.equal(unknownDevice.latestMeasurement?.temperature, 23, '未知結果後讀回須辨識已採用的測量')
+    assert.ok(unknownDevice.latestMeasurement?.temperature >= 18 && unknownDevice.latestMeasurement.temperature <= 28,
+      '未知結果後讀回須辨識已採用的正常測量')
+    await detail.getByText(`${Number.isInteger(unknownDevice.latestMeasurement.temperature)
+      ? unknownDevice.latestMeasurement.temperature.toFixed(1) : unknownDevice.latestMeasurement.temperature}°C`, { exact: true }).waitFor()
     // 用請求紀錄確認未知結果的復原只讀不寫。
     assert.deepEqual(pageControls.map(control => control.action), ['normal', 'normal', 'replay', 'stop', 'normal'],
       '未知結果不得自動重送控制')
@@ -401,14 +423,102 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     const beforeRestart = await responseJson(
       await sendAsHq(simulationPath, 'POST', { action: 'normal', version: manualStopState.version }),
       200,
-      '重啟前開始正常回報',
+      '重啟前恢復正常回報',
     )
     assert.equal(beforeRestart.mode, 'normal', '重啟前設備須處於有效模擬執行中')
     assert.equal(beforeRestart.canReplay, true, '重啟前須有可重送的原始測量')
     const beforeRestartDevice = await responseJson(
       await sendAsHq('/api/devices/north-01'), 200, '重啟前設備讀回',
     )
-    assert.equal(beforeRestartDevice.latestMeasurement?.temperature, 23, '重啟前正常回報須已採用')
+    assert.ok(beforeRestartDevice.latestMeasurement?.temperature >= 18 && beforeRestartDevice.latestMeasurement.temperature <= 28)
+    const precisionSequence = () => BigInt(stack.sql("SELECT sequence FROM latest_measurements WHERE device_id='north-01';"))
+    const sequenceBeforePrecision = precisionSequence()
+    const runBeforeRestart = stack.sql("SELECT run_id FROM measurement_runs WHERE device_id='north-01';")
+    // 只替換讀取回應的合法小數，驗證實際雙區呈現精度；不代替前面的真實測量驗收。
+    await hqPage.setViewportSize({ width: 1280, height: 900 })
+    const precisionPaths = ['/api/devices?limit=50&offset=0', '/api/devices/north-01']
+    let precisionTemperature = 20.01302
+    for (const path of precisionPaths) {
+      await hqPage.route(stack.origin + path, async route => {
+        assert.equal(route.request().method(), 'GET')
+        const loaded = await responseJson(await sendAsHq(path), 200, '小數呈現夾具讀取')
+        const device = path === precisionPaths[0] ? loaded.items.find(item => item.id === 'north-01') : loaded
+        assert.equal(device.id, 'north-01')
+        assert.ok(device.latestMeasurement, '小數呈現夾具須沿用真實的有效測量')
+        device.latestMeasurement.temperature = precisionTemperature
+        await route.fulfill({ json: loaded })
+      })
+    }
+    for (const temperature of [20.01302, 20.013020000000004]) {
+      precisionTemperature = temperature
+      await hqPage.reload()
+      await northRow.getByText(`${temperature}°C`, { exact: true }).waitFor()
+      await northRow.click()
+      await detail.getByText(`${temperature}°C`, { exact: true }).waitFor()
+      assert.equal(await northRow.isVisible(), true, '小數溫度清單與詳情須同時可見')
+      // 逐行文字矩形須完整落在自身及父列／詳情內，不能只以頁面沒有橫向捲動判定。
+      const geometries = []
+      for (const reading of [northRow.locator('.row-temperature'), detail.locator('.temperature-value')]) {
+        geometries.push(await reading.evaluate(element => {
+          const cell = element.getBoundingClientRect()
+          const container = element.closest('.device-button, .detail-pane').getBoundingClientRect()
+          const style = getComputedStyle(element)
+          const range = document.createRange()
+          range.selectNodeContents(element)
+          const lines = [...range.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0)
+          const contains = (outer, inner) => inner.left >= outer.left - 1
+            && inner.right <= outer.right + 1
+            && inner.top >= outer.top - 1
+            && inner.bottom <= outer.bottom + 1
+          const result = {
+            hasText: lines.length > 0,
+            contentFits: element.scrollWidth <= element.clientWidth + 1
+              && element.scrollHeight <= element.clientHeight + 1,
+            withinCell: lines.every(line => contains(cell, line)),
+            withinContainer: lines.every(line => contains(container, line)),
+          }
+          const clipping = []
+          for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+            const computed = getComputedStyle(ancestor)
+            if ([computed.overflowX, computed.overflowY].some(value => ['clip', 'hidden', 'auto', 'scroll'].includes(value))) {
+              const bounds = ancestor.getBoundingClientRect()
+              clipping.push({ className: ancestor.className, bounds: bounds.toJSON(),
+                overflowX: computed.overflowX, overflowY: computed.overflowY,
+                containsText: lines.every(line => contains(bounds, line)) })
+            }
+          }
+          const neighbors = [...element.parentElement.children].filter(child => child !== element).map(neighbor => {
+            const bounds = neighbor.getBoundingClientRect()
+            return { className: neighbor.className, bounds: bounds.toJSON(), textOverlaps: lines.some(line =>
+              Math.min(line.right, bounds.right) - Math.max(line.left, bounds.left) > 1
+              && Math.min(line.bottom, bounds.bottom) - Math.max(line.top, bounds.top) > 1) }
+          })
+          return {
+            className: element.className, result, cell: cell.toJSON(), container: container.toJSON(),
+            lines: lines.map(line => line.toJSON()),
+            clientWidth: element.clientWidth, scrollWidth: element.scrollWidth,
+            clientHeight: element.clientHeight, scrollHeight: element.scrollHeight,
+            fontSize: style.fontSize, lineHeight: style.lineHeight,
+            overflowX: style.overflowX, overflowY: style.overflowY, clipping, neighbors,
+          }
+        }))
+      }
+      for (const geometry of geometries) {
+        assert.deepEqual(geometry.result, { hasText: true, contentFits: true, withinCell: true, withinContainer: true },
+          `${temperature}°C ${geometry.className} 的文字不可內部裁切或超出父區塊：${JSON.stringify(geometries)}`)
+        assert.ok(geometry.clipping.every(ancestor => ancestor.containsText === true),
+          `${temperature}°C ${geometry.className} 的文字不可被祖先裁切：${JSON.stringify(geometries)}`)
+        assert.ok(geometry.neighbors.every(neighbor => neighbor.textOverlaps === false),
+          `${temperature}°C ${geometry.className} 的文字不可與相鄰元素重疊：${JSON.stringify(geometries)}`)
+      }
+    }
+    for (const path of precisionPaths) await hqPage.unroute(stack.origin + path)
+    const afterPrecision = await responseJson(await sendAsHq('/api/devices/north-01'), 200, '小數夾具後真實測量')
+    assert.ok(afterPrecision.latestMeasurement.temperature >= 18 && afterPrecision.latestMeasurement.temperature <= 28)
+    assert.ok(![20.01302, 20.013020000000004].includes(afterPrecision.latestMeasurement.temperature),
+      '呈現夾具不得改寫真實測量')
+    assert.ok(precisionSequence() >= sequenceBeforePrecision, 'GET夾具不得重設採用序列')
+    assert.ok(Date.parse(afterPrecision.latestMeasurement.receivedAt) >= Date.parse(beforeRestartDevice.latestMeasurement.receivedAt))
     // 瀏覽器驗證已結束，先關閉頁面及串流，後續由正式 API 驗證重啟。
     assert.equal(expectedResources.find(resource => resource.url === stack.origin + '/api/session')?.count, 2,
       '只允許兩筆未登入時的 session 探查回應')
@@ -428,21 +538,242 @@ test('IoT 票 03：真實瀏覽器模擬控制與衝突復原', { timeout: 600_0
     const afterRestartDevice = await responseJson(
       await sendAsHq('/api/devices/north-01'), 200, '重啟後設備讀回',
     )
-    assert.equal(afterRestart.mode, 'stopped', '服務重啟後模擬須保持停止')
-    assert.equal(afterRestart.canReplay, false, '服務重啟後不可重送舊執行原始測量')
-    assert.equal(afterRestartDevice.latestMeasurement?.temperature, 23, '重啟須保留最新有效溫度')
+    assert.notEqual(stack.sql("SELECT run_id FROM measurement_runs WHERE device_id='north-01';"), runBeforeRestart,
+      '重啟必須撤銷舊run並採用新執行首報')
+    assert.equal(afterRestart.mode, 'normal', '重啟補判後須自動恢復正常回報')
+    assert.equal(afterRestart.canReplay, true, '重啟後只能重送已採用的新執行首報')
+    assert.ok(afterRestartDevice.latestMeasurement?.temperature >= 18 && afterRestartDevice.latestMeasurement.temperature <= 28)
+    assert.ok(Date.parse(afterRestartDevice.latestMeasurement.receivedAt) > Date.parse(afterPrecision.latestMeasurement.receivedAt))
 
     // 跨過五秒回報週期，確認重啟後沒有自行恢復產生測量。
     await setTimeout(5_250, undefined, { signal: t.signal })
     const laterSimulation = await responseJson(await sendAsHq(simulationPath), 200, '重啟觀察期後模擬狀態讀回')
     const laterDevice = await responseJson(await sendAsHq('/api/devices/north-01'), 200, '重啟觀察期後設備讀回')
-    assert.equal(laterSimulation.mode, 'stopped', '重啟後跨過回報週期仍須保持停止')
-    assert.equal(laterSimulation.canReplay, false, '重啟後跨過回報週期仍不可重送')
-    assert.deepEqual(laterDevice.latestMeasurement, afterRestartDevice.latestMeasurement,
-      '重啟後跨過回報週期不得出現新測量')
+    assert.equal(laterSimulation.mode, 'normal', '重啟後跨過回報週期仍須正常回報')
+    assert.equal(laterSimulation.canReplay, true, '週期採用後仍有新執行測量可重送')
+    assert.notEqual(laterDevice.latestMeasurement.temperature, afterRestartDevice.latestMeasurement.temperature)
+    assert.ok(Date.parse(laterDevice.latestMeasurement.receivedAt) > Date.parse(afterRestartDevice.latestMeasurement.receivedAt),
+      '重啟後跨過回報週期須有新採用測量')
 
   } finally {
     // 即使中途失敗也先釋放 Chrome，讓外層回收測試專案。
+    await browser.close()
+  }
+})
+
+// 換頁 GET 較早、合法控制較晚；提交與未知結果讀回不受被取消的頁面影響。
+test('SPEC-002：較晚控制保留原頁與原設備的提交及讀回', { timeout: 600_000 }, async t => {
+  const stack = await createStack()
+  t.after(() => stack.cleanup())
+  stack.start()
+  const passwords = JSON.parse(readFileSync(join(stack.state, 'demo-passwords.json'), 'utf8'))
+  const send = (path, cookie, body) => stack.send(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { Cookie: cookie, ...(body === undefined ? {} : {
+      Origin: stack.origin, 'X-CSRF-Protection': '1', 'Content-Type': 'application/json',
+    }) }, body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  const login = await send('/api/login', '', { username: 'hq', password: passwords.hq })
+  await responseJson(login, 200, '控制重疊夾具登入')
+  const cookie = login.headers.getSetCookie()[0]?.split(';')[0]
+  assert.ok(cookie?.startsWith('iot_session='))
+  const executablePath = process.env.CHROME_EXECUTABLE ?? [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome', '/usr/bin/chromium',
+  ].find(path => existsSync(path))
+  assert.ok(executablePath && existsSync(executablePath))
+  delete process.env.DEBUG
+  delete process.env.PWDEBUG
+  const { chromium } = await import('playwright-core')
+  const browser = await chromium.launch({ executablePath, timeout: 15_000 })
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+    await context.addCookies([{ name: 'iot_session', value: cookie.slice('iot_session='.length), url: stack.origin,
+      httpOnly: true, sameSite: 'Strict' }])
+    const page = await context.newPage()
+    page.setDefaultTimeout(8_000)
+    const errors = []
+    const writes = []
+    let unknownInjected = false
+    monitorBrowserErrors(page, passwords, errors, stack.origin, [
+      { url: stack.origin + '/favicon.ico', message: 'Failed to load resource: the server responded with a status of 404 (Not Found)', count: 0, maximum: 2 },
+      { url: stack.origin + simulationPath, message: 'Failed to load resource: the server responded with a status of 503 (Service Unavailable)', count: 0, maximum: 1, injectedOnly: true },
+    ], () => unknownInjected)
+    page.on('request', request => {
+      if (request.url() === stack.origin + simulationPath && request.method() === 'POST') writes.push(request.postDataJSON())
+    })
+    const oldDetail = page.getByRole('region', { name: '北區設備 01', exact: true })
+    const reload = page.locator('.reload-button')
+    const next = page.getByRole('button', { name: '下一頁', exact: true })
+    for (const outcome of ['success', 'unknown']) {
+      await t.test(`SPEC-002：換頁等待期間 normal ${outcome} 不遺失原設備`, async child => {
+        const events = new EventEmitter()
+        const pageRelease = Promise.withResolvers()
+        const pageSettled = Promise.withResolvers()
+        const controlRelease = Promise.withResolvers()
+        const controlSettled = Promise.withResolvers()
+        const readbackRelease = Promise.withResolvers()
+        const readbackSettled = Promise.withResolvers()
+        let oldPageRequest
+        let cancelled
+        let committed
+        let committedStatus
+        let browserStatus
+        let readbackHeld = false
+        let unknownDelivered = false
+        const start = writes.length
+        const recordAbort = request => {
+          if (request === oldPageRequest) cancelled = request.failure()?.errorText
+        }
+        // 以實際 offset 回應兩頁，避免背景補讀用 fixture phase 掩蓋錯頁。
+        const pageRoute = async route => {
+          const second = new URL(route.request().url()).searchParams.get('offset') === '50'
+          const inventory = await responseJson(await send('/api/devices?limit=100', cookie), 200, '重疊夾具讀清單')
+          const snapshot = { items: second ? inventory.items.slice(4) : inventory.items.slice(0, 2),
+            total: 100, limit: 50, offset: second ? 50 : 0 }
+          if (second && !oldPageRequest) {
+            oldPageRequest = route.request()
+            try {
+              events.emit('page-held')
+              await pageRelease.promise
+              await route.fulfill({ json: snapshot })
+            } finally {
+              pageSettled.resolve()
+            }
+          } else await route.fulfill({ json: snapshot })
+        }
+        let abnormal
+        // POST 只轉送一次原本文；已提交但回503時，保留真正的讀回與 pending 邊界。
+        const controlRoute = async route => {
+          const request = route.request()
+          if (request.method() === 'GET') {
+            if (unknownDelivered && committed && !readbackHeld) {
+              readbackHeld = true
+              try {
+                const snapshot = await responseJson(await send(simulationPath, cookie), 200, '未知結果正式讀回')
+                events.emit('readback-held')
+                await readbackRelease.promise
+                await route.fulfill({ json: snapshot })
+              } finally {
+                readbackSettled.resolve()
+              }
+            } else await route.continue()
+            return
+          }
+          try {
+            assert.equal(request.method(), 'POST')
+            assert.deepEqual(request.postDataJSON(), { action: 'normal', version: abnormal.version })
+            const headers = await request.allHeaders()
+            assert.equal(headers.origin, stack.origin)
+            assert.equal(headers['x-csrf-protection'], '1')
+            assert.ok(headers.cookie === cookie, '轉送只可使用原總部 session')
+            const response = await stack.send(simulationPath, { method: 'POST', headers: {
+              Cookie: headers.cookie, Origin: headers.origin, 'X-CSRF-Protection': headers['x-csrf-protection'],
+              'Content-Type': headers['content-type'],
+            }, body: request.postData() })
+            committedStatus = response.status
+            committed = await responseJson(response, 200, '重疊控制真正提交')
+            assert.equal(committed.mode, 'normal')
+            events.emit('committed')
+            await controlRelease.promise
+            unknownInjected = outcome === 'unknown'
+            unknownDelivered = outcome === 'unknown'
+            await route.fulfill(outcome === 'unknown'
+              ? { status: 503, json: { error: 'service_unavailable' } } : { json: committed })
+          } finally {
+            controlSettled.resolve()
+          }
+        }
+        page.on('requestfailed', recordAbort)
+        await page.route(stack.origin + '/api/devices?*', pageRoute)
+        try {
+          await page.goto(stack.origin + '/?view=simulation')
+          await oldDetail.locator('.temperature-value').waitFor()
+          await page.waitForFunction(() => !document.querySelector('.reload-button').disabled)
+          const prior = await responseJson(await send(simulationPath, cookie), 200, '讀取異常控制版本')
+          const [abnormalResponse] = await Promise.all([
+            page.waitForResponse(response => response.url() === stack.origin + simulationPath && response.request().method() === 'POST'),
+            page.getByRole('button', { name: '開始異常回報', exact: true }).click(),
+          ])
+          abnormal = await responseJson(abnormalResponse, 200, '建立真正異常')
+          await oldDetail.getByText('30.0°C', { exact: true }).waitFor()
+          await page.waitForFunction(() => !document.querySelector('.reload-button').disabled)
+          await page.route(stack.origin + simulationPath, controlRoute)
+          await Promise.all([
+            once(events, 'page-held', { signal: AbortSignal.timeout(8_000) }), next.click(),
+          ])
+          assert.deepEqual(await page.locator('.device-list .device-name').allTextContents(), ['北區設備 01', '北區設備 02'])
+          const normal = page.getByRole('button', { name: '恢復正常', exact: true })
+          assert.equal(await normal.isEnabled(), true, '較早清單 GET 尚未回覆時，原設備的合法控制可達')
+          await Promise.all([
+            once(events, 'committed', { signal: AbortSignal.timeout(8_000) }), normal.click(),
+          ])
+          assert.equal(await next.isDisabled(), true)
+          assert.equal(await oldDetail.getByRole('button', { name: /返回設備清單/ }).isDisabled(), true)
+          assert.equal(await normal.isDisabled(), true)
+          pageRelease.resolve()
+          await pageSettled.promise
+          const normalResponse = page.waitForResponse(response => response.url() === stack.origin + simulationPath
+            && response.request().method() === 'POST')
+          const readbackReady = outcome === 'unknown'
+            ? once(events, 'readback-held', { signal: AbortSignal.timeout(8_000) }) : null
+          controlRelease.resolve()
+          const delivered = await normalResponse
+          browserStatus = delivered.status()
+          assert.deepEqual(await responseJson(delivered, outcome === 'unknown' ? 503 : 200, '瀏覽器控制回應'),
+            outcome === 'unknown' ? { error: 'service_unavailable' } : committed)
+          if (readbackReady) {
+            await readbackReady
+            await oldDetail.getByRole('alert').filter({ hasText: '未能確認操作結果。' }).waitFor()
+            assert.equal(await next.isDisabled(), true, '未知結果讀回完成前仍保留寫入保護')
+            assert.equal(writes.length - start, 2, '未知結果只能讀回，不可重送 normal')
+            readbackRelease.resolve()
+          } else await oldDetail.getByText('已恢復正常回報。', { exact: true }).waitFor()
+          await oldDetail.getByText('模擬模式：正常回報', { exact: true }).waitFor()
+          await page.waitForFunction(() => !document.querySelector('.reload-button').disabled)
+          assert.deepEqual(writes.slice(start), [{ action: 'abnormal', version: prior.version }, { action: 'normal', version: abnormal.version }])
+          assert.deepEqual(await responseJson(await send(simulationPath, cookie), 200, '控制終態正式讀回'), committed)
+          assert.deepEqual(await page.locator('.device-list .device-name').allTextContents(), ['北區設備 01', '北區設備 02'],
+            '較晚合法控制須取消較早換頁，提交或確認完成後仍保留原頁')
+          assert.equal(cancelled, 'net::ERR_ABORTED')
+          assert.equal(await page.getByRole('button', { name: /北區設備 01/ }).getAttribute('aria-pressed'), 'true')
+          const baseline = await responseJson(await send('/api/devices/north-01', cookie), 200, 'SSE 前原設備讀回')
+          const updatedResponse = await page.waitForResponse(async response => response.url() === stack.origin + '/api/devices/north-01'
+            && response.status() === 200
+            && Date.parse((await response.json()).latestMeasurement.receivedAt) > Date.parse(baseline.latestMeasurement.receivedAt))
+          const updated = await updatedResponse.json()
+          const temperature = `${Number.isInteger(updated.latestMeasurement.temperature)
+            ? updated.latestMeasurement.temperature.toFixed(1) : updated.latestMeasurement.temperature}°C`
+          await oldDetail.getByText(temperature, { exact: true }).waitFor()
+          await page.getByRole('button', { name: /北區設備 01/ }).getByText(temperature, { exact: true }).waitFor()
+          await oldDetail.locator(`time[datetime="${updated.latestMeasurement.receivedAt}"]`).waitFor()
+          assert.equal(await oldDetail.locator('time').getAttribute('datetime'), updated.latestMeasurement.receivedAt)
+          assert.equal(await page.getByRole('button', { name: /北區設備 01/ }).getAttribute('aria-pressed'), 'true')
+          assert.deepEqual(await page.locator('.device-list .device-name').allTextContents(), ['北區設備 01', '北區設備 02'])
+          await reload.click()
+          await page.waitForFunction(() => !document.querySelector('.reload-button').disabled)
+          assert.equal(await page.getByRole('button', { name: /北區設備 01/ }).getAttribute('aria-pressed'), 'true')
+          await next.click()
+          await page.getByRole('region', { name: '南區設備 02', exact: true }).locator('.temperature-value').waitFor()
+          assert.equal(await page.getByRole('button', { name: /南區設備 02/ }).getAttribute('aria-pressed'), 'true')
+        } finally {
+          pageRelease.resolve()
+          controlRelease.resolve()
+          readbackRelease.resolve()
+          if (oldPageRequest) await pageSettled.promise
+          if (committed) await controlSettled.promise
+          if (readbackHeld) await readbackSettled.promise
+          page.off('requestfailed', recordAbort)
+          await page.unroute(stack.origin + '/api/devices?*', pageRoute)
+          await page.unroute(stack.origin + simulationPath, controlRoute)
+          child.diagnostic(JSON.stringify({ case: outcome, committedStatus, browserStatus, mode: committed?.mode,
+            normalPosts: writes.slice(start).filter(item => item.action === 'normal').length, cancelled: cancelled ?? null,
+            list: await page.locator('.device-list .device-name').allTextContents(),
+            detail: await page.locator('.detail-pane h2').allTextContents(), cleanup: 'released and unregistered' }))
+        }
+      })
+    }
+    assert.deepEqual(errors, [], '重疊案例不得有非預期瀏覽器錯誤')
+  } finally {
     await browser.close()
   }
 })
